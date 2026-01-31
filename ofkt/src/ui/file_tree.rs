@@ -34,7 +34,7 @@ impl FileTreeView {
     /// ツリーを描画（仮想化対応）
     ///
     /// # 戻り値
-    /// クリックされたアイテムのインデックス
+    /// (シングルクリックで選択されたインデックス, ダブルクリックで開くインデックス)
     ///
     /// # パフォーマンス最適化
     /// - 大量のアイテムでもスムーズに表示するため、仮想化を実装
@@ -45,8 +45,9 @@ impl FileTreeView {
         ui: &mut egui::Ui,
         items: &[FileAlias],
         selected_index: Option<usize>,
-    ) -> Option<usize> {
-        let mut clicked_index = None;
+    ) -> (Option<usize>, Option<usize>) {
+        let mut selected_result = None;
+        let mut open_result = None;
 
         // お気に入りを上部に表示するためにソート
         let mut sorted_items: Vec<(usize, &FileAlias)> = items.iter().enumerate().collect();
@@ -65,8 +66,12 @@ impl FileTreeView {
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
                     for (original_index, item) in sorted_items.iter() {
-                        if let Some(clicked) = self.render_item(ui, item, *original_index, selected_index) {
-                            clicked_index = Some(clicked);
+                        let (selected, open) = self.render_item(ui, item, *original_index, selected_index);
+                        if selected.is_some() {
+                            selected_result = selected;
+                        }
+                        if open.is_some() {
+                            open_result = open;
                         }
                     }
                 });
@@ -82,8 +87,12 @@ impl FileTreeView {
                         for index in row_range {
                             if index < sorted_items.len() {
                                 let (original_index, item) = sorted_items[index];
-                                if let Some(clicked) = self.render_item(ui, item, original_index, selected_index) {
-                                    clicked_index = Some(clicked);
+                                let (selected, open) = self.render_item(ui, item, original_index, selected_index);
+                                if selected.is_some() {
+                                    selected_result = selected;
+                                }
+                                if open.is_some() {
+                                    open_result = open;
                                 }
                             }
                         }
@@ -91,24 +100,25 @@ impl FileTreeView {
                 );
         }
 
-        clicked_index
+        (selected_result, open_result)
     }
 
     /// 個別のアイテムを描画（再帰的）
     ///
     /// # 戻り値
-    /// クリックされた場合、そのインデックスを返す
+    /// (シングルクリックで選択されたインデックス, ダブルクリックで開くインデックス)
     fn render_item(
         &mut self,
         ui: &mut egui::Ui,
         item: &FileAlias,
         index: usize,
         selected_index: Option<usize>,
-    ) -> Option<usize> {
+    ) -> (Option<usize>, Option<usize>) {
         let is_expanded = self.is_expanded(&item.id);
         let is_folder = item.path.is_dir();
         let is_selected = selected_index == Some(index);
-        let mut clicked = None;
+        let mut selected = None;
+        let mut open = None;
 
         ui.horizontal(|ui| {
             // 展開/折りたたみアイコン（フォルダのみ）
@@ -126,15 +136,23 @@ impl FileTreeView {
             ui.label(icon);
 
             // エイリアス名（選択可能）
-            if ui.selectable_label(is_selected, &item.alias).clicked() {
-                clicked = Some(index);
+            let response = ui.selectable_label(is_selected, &item.alias);
+
+            // シングルクリック → 選択のみ
+            if response.clicked() {
+                selected = Some(index);
+            }
+
+            // ダブルクリック → 開く
+            if response.double_clicked() {
+                open = Some(index);
             }
 
             // パス
             ui.label(format!("-> {}", item.path.display()));
         });
 
-        clicked
+        (selected, open)
     }
 
     /// ノードの展開状態をトグル
@@ -258,7 +276,7 @@ impl FileTreeView {
     /// - `level`: 階層レベル（0 = ルート）
     ///
     /// # 戻り値
-    /// (クリックされたパス, 右クリックかどうか)
+    /// (シングルクリックで選択されたパス, ダブルクリックで開くパス, 右クリックかどうか)
     fn render_tree_node(
         &mut self,
         ui: &mut egui::Ui,
@@ -268,10 +286,10 @@ impl FileTreeView {
         selected_index: Option<usize>,
         level: usize,
         pasted_highlight: Option<&crate::app::state::PastedFileHighlight>,
-    ) -> (Option<PathBuf>, bool) {
+    ) -> (Option<PathBuf>, Option<PathBuf>, bool) {
         // ディレクトリのみ処理
         if !entry.is_directory {
-            return (None, false);
+            return (None, None, false);
         }
 
         // 現在のアイテムのインデックスを取得
@@ -281,7 +299,9 @@ impl FileTreeView {
         let is_expanded = expanded_dirs.contains(&entry.path);
         let is_selected = selected_index == Some(current_index);
         let icon = if is_expanded { "▼" } else { "▶" };
-        let mut clicked_result = (None, false);
+        let mut selected_result: Option<PathBuf> = None;
+        let mut open_result: Option<PathBuf> = None;
+        let mut is_right_click = false;
 
         // ペースト直後のハイライト判定
         let is_pasted = pasted_highlight
@@ -324,12 +344,18 @@ impl FileTreeView {
                 ui.selectable_label(is_selected, label)
             };
 
-            // クリック検出
+            // シングルクリック → 選択のみ
             if response.clicked() {
-                clicked_result = (Some(entry.path.clone()), false);
+                selected_result = Some(entry.path.clone());
             }
+            // ダブルクリック → 開く
+            if response.double_clicked() {
+                open_result = Some(entry.path.clone());
+            }
+            // 右クリック
             if response.secondary_clicked() {
-                clicked_result = (Some(entry.path.clone()), true);
+                selected_result = Some(entry.path.clone());
+                is_right_click = true;
             }
         });
 
@@ -355,7 +381,7 @@ impl FileTreeView {
                     for sub_entry in sub_items.iter() {
                         if sub_entry.is_directory {
                             // ディレクトリは再帰的に処理
-                            let sub_result = self.render_tree_node(
+                            let (sub_selected, sub_open, sub_right_click) = self.render_tree_node(
                                 ui,
                                 sub_entry,
                                 flat_index,  // アキュムレータを渡す（インクリメントされ続ける）
@@ -365,8 +391,12 @@ impl FileTreeView {
                                 pasted_highlight,  // ハイライト情報を渡す
                             );
 
-                            if sub_result.0.is_some() {
-                                clicked_result = sub_result;
+                            if sub_selected.is_some() {
+                                selected_result = sub_selected;
+                                is_right_click = sub_right_click;
+                            }
+                            if sub_open.is_some() {
+                                open_result = sub_open;
                             }
                         } else {
                             // ファイルはシンプルに表示
@@ -374,11 +404,18 @@ impl FileTreeView {
                                 ui.add_space((level + 1) as f32 * 20.0);
                                 let response = ui.label(format!("📄 {}", sub_entry.name));
 
+                                // シングルクリック → 選択のみ
                                 if response.clicked() {
-                                    clicked_result = (Some(sub_entry.path.clone()), false);
+                                    selected_result = Some(sub_entry.path.clone());
                                 }
+                                // ダブルクリック → 開く
+                                if response.double_clicked() {
+                                    open_result = Some(sub_entry.path.clone());
+                                }
+                                // 右クリック
                                 if response.secondary_clicked() {
-                                    clicked_result = (Some(sub_entry.path.clone()), true);
+                                    selected_result = Some(sub_entry.path.clone());
+                                    is_right_click = true;
                                 }
                             });
                         }
@@ -387,7 +424,7 @@ impl FileTreeView {
             });
         }
 
-        clicked_result
+        (selected_result, open_result, is_right_click)
     }
 
     /// DirectoryEntryをツリー形式でレンダリング（エントリーポイント）
@@ -399,7 +436,7 @@ impl FileTreeView {
     /// - `selected_index`: 選択されているインデックス
     ///
     /// # 戻り値
-    /// (クリックされたパス, 右クリックかどうか, 総アイテム数)
+    /// (シングルクリックで選択されたパス, ダブルクリックで開くパス, 右クリックかどうか, 総アイテム数)
     pub fn render_directory_tree(
         &mut self,
         ui: &mut egui::Ui,
@@ -407,8 +444,9 @@ impl FileTreeView {
         expanded_dirs: &mut HashSet<PathBuf>,
         selected_index: Option<usize>,
         pasted_highlight: Option<&crate::app::state::PastedFileHighlight>,
-    ) -> (Option<PathBuf>, bool, usize) {
-        let mut clicked_result = None;
+    ) -> (Option<PathBuf>, Option<PathBuf>, bool, usize) {
+        let mut selected_result: Option<PathBuf> = None;
+        let mut open_result: Option<PathBuf> = None;
         let mut is_right_click = false;
         let mut flat_index = 0;  // アキュムレータを初期化
 
@@ -417,7 +455,7 @@ impl FileTreeView {
 
             if entry.is_directory {
                 // ディレクトリは render_tree_node() に委譲
-                let (result_path, right_click) = self.render_tree_node(
+                let (sub_selected, sub_open, sub_right_click) = self.render_tree_node(
                     ui,
                     entry,
                     &mut flat_index,  // アキュムレータを渡す
@@ -427,9 +465,12 @@ impl FileTreeView {
                     pasted_highlight,  // ハイライト情報を渡す
                 );
 
-                if result_path.is_some() {
-                    clicked_result = result_path;
-                    is_right_click = right_click;
+                if sub_selected.is_some() {
+                    selected_result = sub_selected;
+                    is_right_click = sub_right_click;
+                }
+                if sub_open.is_some() {
+                    open_result = sub_open;
                 }
             } else {
                 // ファイルは従来通りの処理
@@ -437,12 +478,17 @@ impl FileTreeView {
                     let label = format!("📄 {}", entry.name);
                     let response = ui.selectable_label(is_selected, label);
 
+                    // シングルクリック → 選択のみ
                     if response.clicked() {
-                        clicked_result = Some(entry.path.clone());
-                        is_right_click = false;
+                        selected_result = Some(entry.path.clone());
                     }
+                    // ダブルクリック → 開く
+                    if response.double_clicked() {
+                        open_result = Some(entry.path.clone());
+                    }
+                    // 右クリック
                     if response.secondary_clicked() {
-                        clicked_result = Some(entry.path.clone());
+                        selected_result = Some(entry.path.clone());
                         is_right_click = true;
                     }
                 });
@@ -450,6 +496,6 @@ impl FileTreeView {
             }
         }
 
-        (clicked_result, is_right_click, flat_index)  // 総アイテム数を返す
+        (selected_result, open_result, is_right_click, flat_index)  // 総アイテム数を返す
     }
 }

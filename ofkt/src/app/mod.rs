@@ -640,14 +640,22 @@ impl eframe::App for OfktApp {
                                 None
                             };
 
-                            if let Some(clicked_index) = self.file_tree.render(
+                            let (selected_index, open_index) = self.file_tree.render(
                                 ui,
                                 &self.state.filtered_items,
                                 display_selected_index,
-                            ) {
-                                self.state.selected_index = Some(clicked_index);
+                            );
 
-                                if let Some(alias) = self.state.filtered_items.get(clicked_index) {
+                            // シングルクリック → 選択のみ
+                            if let Some(idx) = selected_index {
+                                self.state.selected_index = Some(idx);
+                            }
+
+                            // ダブルクリック → ファイルを開く / ディレクトリに移動
+                            if let Some(idx) = open_index {
+                                self.state.selected_index = Some(idx);
+
+                                if let Some(alias) = self.state.filtered_items.get(idx) {
                                     if alias.path.is_dir() {
                                         if let Err(e) = self.state.init_directory_browser(alias.path.clone()) {
                                             log::error!("エイリアスパスへの移動に失敗: {}", e);
@@ -1404,7 +1412,7 @@ impl eframe::App for OfktApp {
                                     None
                                 };
 
-                                let (clicked_path, is_right_click, total_items) = self.file_tree.render_directory_tree(
+                                let (selected_path, open_path, is_right_click, total_items) = self.file_tree.render_directory_tree(
                                     ui,
                                     &filtered_entries,
                                     &mut self.state.expanded_directories,
@@ -1426,15 +1434,15 @@ impl eframe::App for OfktApp {
                                     }
                                 }
 
-                                // クリック処理（filtered_entriesを使用）
-                                if let Some(path) = clicked_path {
+                                // シングルクリック → 選択のみ
+                                if let Some(ref path) = selected_path {
                                     // パスからインデックスを検索
                                     self.state.selected_directory_index = filtered_entries.iter()
-                                        .position(|e| paths_equal(&e.path, &path));
+                                        .position(|e| paths_equal(&e.path, path));
 
                                     if is_right_click {
                                         // 右クリックの場合、コンテキストメニューを表示
-                                        if let Some(entry) = filtered_entries.iter().find(|e| paths_equal(&e.path, &path)) {
+                                        if let Some(entry) = filtered_entries.iter().find(|e| paths_equal(&e.path, path)) {
                                             ui.menu_button("操作", |ui| {
                                                 if let Some(action) = ContextMenu::show_for_directory_entry(ui, entry) {
                                                     // アクションを処理
@@ -1461,10 +1469,14 @@ impl eframe::App for OfktApp {
                                                 }
                                             });
                                         }
-                                    } else if let Some(entry) = filtered_entries.iter().find(|e| paths_equal(&e.path, &path)) {
-                                        // 左クリックの場合、既存の動作
+                                    }
+                                }
+
+                                // ダブルクリック → ファイルを開く / ディレクトリに移動
+                                if let Some(ref path) = open_path {
+                                    if let Some(entry) = filtered_entries.iter().find(|e| paths_equal(&e.path, path)) {
                                         if entry.is_directory {
-                                            // ディレクトリをクリックで移動
+                                            // ディレクトリをダブルクリックで移動
                                             if let Err(e) = self.state.directory_browser.as_mut().unwrap().navigate_to(entry.path.clone()) {
                                                 log::error!("ディレクトリの移動に失敗: {}", e);
                                             } else {
@@ -1472,7 +1484,7 @@ impl eframe::App for OfktApp {
                                                 self.state.directory_search_query.clear();
                                             }
                                         } else {
-                                            // ファイルをクリックで開く
+                                            // ファイルをダブルクリックで開く
                                             let file_manager = FileManager::new();
                                             if let Err(e) = file_manager.open(&entry.path) {
                                                 log::error!("ファイルを開くのに失敗: {}", e);
