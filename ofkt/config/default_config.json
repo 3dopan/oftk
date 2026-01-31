@@ -1,0 +1,43 @@
+{
+  "version": "0.1.0",
+  "window": {
+    "width": 300.0,
+    "height": 1080.0,
+    "position": {
+      "x": 1620.0,
+      "y": 0.0
+    },
+    "always_on_top": false,
+    "decorations": true
+  },
+  "hotkey": {
+    "enabled": true,
+    "modifiers": ["Control", "Alt"],
+    "key": "F"
+  },
+  "edge_trigger": {
+    "enabled": true,
+    "edge": "right",
+    "delay_ms": 300,
+    "trigger_width": 1
+  },
+  "autostart": {
+    "enabled": true
+  },
+  "theme": {
+    "mode": "system",
+    "custom_accent_color": null
+  },
+  "search": {
+    "incremental": true,
+    "fuzzy_match": true,
+    "search_paths": true,
+    "search_aliases": true,
+    "case_sensitive": false
+  },
+  "file_operations": {
+    "confirm_delete": true,
+    "use_trash": true,
+    "default_open_action": "system_default"
+  }
+}

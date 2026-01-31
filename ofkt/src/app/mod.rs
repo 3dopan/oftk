@@ -1,0 +1,1697 @@
+pub mod state;
+
+use state::{AppState, BrowseMode, FocusArea};
+use eframe::egui;
+use log::info;
+use crate::ui::theme::Theme;
+use crate::ui::search_bar::SearchBar;
+use crate::ui::file_tree::FileTreeView;
+use crate::ui::context_menu::{ContextMenu, MenuAction};
+use crate::core::file_manager::FileManager;
+use crate::platform::{theme_detector, TrayEvent};
+use crate::utils::path::paths_equal;
+use std::time::{Duration, Instant};
+
+/// Ofkt アプリケーション
+pub struct OfktApp {
+    state: AppState,
+    search_bar: SearchBar,
+    file_tree: FileTreeView,
+}
+
+impl Default for OfktApp {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl OfktApp {
+    /// 新しい OfktApp を作成
+    ///
+    /// # パフォーマンス最適化（Task 6.1.3）
+    /// - 起動時は最小限の初期化のみを行う
+    /// - 設定とエイリアスの読み込みは遅延初期化で行う
+    /// - UI の表示を優先し、起動時間を短縮
+    pub fn new() -> Self {
+        let state = AppState::new();
+
+        // 起動時は最小限の初期化のみ
+        // 設定とエイリアスの読み込みは update() で遅延実行
+
+        Self {
+            state,
+            search_bar: SearchBar::new(),
+            file_tree: FileTreeView::new(),
+        }
+    }
+
+    /// テーマを適用
+    fn apply_theme(&mut self, ctx: &egui::Context) {
+        let theme = if let Some(ref config) = self.state.config {
+            match config.theme.mode.as_str() {
+                "system" => {
+                    // システムテーマを検出
+                    theme_detector::detect_system_theme()
+                }
+                "light" => Theme::Light,
+                "dark" => Theme::Dark,
+                _ => Theme::Dark, // デフォルトはダーク
+            }
+        } else {
+            Theme::Dark
+        };
+
+        // テーマを状態に保存
+        self.state.current_theme = theme;
+
+        // egui にテーマを適用
+        ctx.set_visuals(theme.to_visuals());
+    }
+
+    /// ウィンドウの表示/非表示を切り替える
+    fn toggle_window_visibility(&mut self, ctx: &egui::Context) {
+        self.state.is_window_visible = !self.state.is_window_visible;
+
+        if self.state.is_window_visible {
+            // ウィンドウを表示（最小化を解除）
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        } else {
+            // ウィンドウを非表示（最小化）
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+        }
+
+        log::info!("ウィンドウ表示切り替え: {}",
+            if self.state.is_window_visible { "表示" } else { "非表示" });
+    }
+
+    /// クリップボードからファイルをペースト（ディレクトリモード用）
+    fn handle_paste(&mut self) {
+        let current_dir = if let Some(ref browser) = self.state.directory_browser {
+            browser.current_path().to_path_buf()
+        } else {
+            log::error!("ディレクトリブラウザが初期化されていません");
+            return;
+        };
+
+        self.handle_paste_to_dir(current_dir);
+
+        // ディレクトリをリロード
+        if let Some(ref mut browser) = self.state.directory_browser {
+            if let Err(e) = browser.reload() {
+                log::error!("ディレクトリリロード失敗: {}", e);
+            }
+        }
+    }
+
+    /// 指定ディレクトリにクリップボードからファイルをペースト
+    fn handle_paste_to_dir(&mut self, dest_dir: std::path::PathBuf) {
+        log::info!("ペースト開始: dest_dir={}", dest_dir.display());
+
+        let _file_manager = FileManager::new();
+        let paths = self.state.clipboard_state.paths.clone();
+        let mode = self.state.clipboard_state.mode;
+
+        log::debug!("クリップボード内容: {} 個のパス, モード={:?}", paths.len(), mode);
+
+        // === 事前検証フェーズ ===
+        log::debug!("=== 事前検証フェーズ開始 ===");
+        let mut validation_errors = Vec::new();
+
+        // 1. コピー元の存在確認
+        for src_path in paths.iter() {
+            if !src_path.exists() {
+                log::debug!("コピー元存在確認: NG - {}", src_path.display());
+                validation_errors.push(format!("「{}」が存在しません",
+                    src_path.file_name().unwrap_or_default().to_string_lossy()));
+            } else {
+                log::debug!("コピー元存在確認: OK - {}", src_path.display());
+            }
+        }
+
+        // 2. コピー先ディレクトリの確認
+        if !dest_dir.exists() {
+            log::debug!("コピー先ディレクトリ確認: NG - 存在しない: {}", dest_dir.display());
+            validation_errors.push(format!("コピー先ディレクトリ「{}」が存在しません", dest_dir.display()));
+        } else if !dest_dir.is_dir() {
+            log::debug!("コピー先ディレクトリ確認: NG - ディレクトリではない: {}", dest_dir.display());
+            validation_errors.push(format!("「{}」はディレクトリではありません", dest_dir.display()));
+        } else {
+            log::debug!("コピー先ディレクトリ確認: OK - {}", dest_dir.display());
+        }
+
+        // 3. 書き込み権限の確認
+        if dest_dir.exists() {
+            if let Ok(metadata) = dest_dir.metadata() {
+                if metadata.permissions().readonly() {
+                    log::debug!("書き込み権限確認: NG - 読み取り専用: {}", dest_dir.display());
+                    validation_errors.push(format!("コピー先ディレクトリ「{}」は読み取り専用です", dest_dir.display()));
+                } else {
+                    log::debug!("書き込み権限確認: OK - 書き込み可能: {}", dest_dir.display());
+                }
+            } else {
+                log::debug!("書き込み権限確認: 警告 - メタデータ取得失敗");
+            }
+        }
+
+        // 4. ディスク容量の推定確認（簡易版）
+        // 注: 正確な実装はfs2クレートなどが必要
+        log::debug!("ディスク容量確認: スキップ（未実装）");
+
+        // 検証エラーがある場合は警告を表示して中断
+        if !validation_errors.is_empty() {
+            log::warn!("=== 事前検証フェーズ失敗 === エラー数: {}", validation_errors.len());
+            log::warn!("検証エラー: {}", validation_errors.join(", "));
+            let error_message = format!("ペースト操作を実行できません:\n{}", validation_errors.join("\n"));
+            self.state.paste_result_message = Some(
+                crate::app::state::PasteResultMessage::new(
+                    error_message,
+                    crate::app::state::MessageType::Error
+                )
+            );
+            return;
+        }
+
+        log::debug!("=== 事前検証フェーズ完了 ===");
+
+        // ペースト前に上書きされるファイルをチェック
+        let mut files_to_overwrite = Vec::new();
+
+        for src_path in paths.iter() {
+            if let Some(file_name) = src_path.file_name() {
+                let dest_path = dest_dir.join(file_name);
+                if dest_path.exists() && src_path != &dest_path {
+                    files_to_overwrite.push(dest_path);
+                }
+            }
+        }
+
+        // 上書き対象がある場合、確認ダイアログを表示
+        if !files_to_overwrite.is_empty() {
+            log::info!("上書き確認ダイアログ表示: {} 個のファイルが上書き対象", files_to_overwrite.len());
+            self.state.overwrite_confirmation_dialog = Some(
+                crate::app::state::OverwriteConfirmationDialog {
+                    files: files_to_overwrite,
+                    pending_paste: crate::app::state::PendingPasteOperation {
+                        src_paths: paths.clone(),
+                        dest_dir: dest_dir.clone(),
+                        mode,
+                    },
+                }
+            );
+            return; // 確認待ちで処理を保留
+        }
+
+        // === 実行フェーズ ===
+        // 上書き確認をスキップして実行
+        log::info!("ペースト実行（上書き確認なし）");
+        self.execute_paste_operation(crate::app::state::PendingPasteOperation {
+            src_paths: paths,
+            dest_dir,
+            mode,
+        });
+    }
+
+    /// ペースト操作を実行（上書き確認をスキップ）
+    fn execute_paste_operation(&mut self, operation: crate::app::state::PendingPasteOperation) {
+        use crate::core::clipboard::{ClipboardMode, generate_copy_name};
+
+        let file_manager = FileManager::new();
+        let paths = operation.src_paths;
+        let dest_dir = operation.dest_dir;
+        let mode = operation.mode;
+
+        log::info!("=== ペースト実行開始 === モード: {:?}, ファイル数: {}, 宛先: {}",
+            mode, paths.len(), dest_dir.display());
+
+        let mut pasted_paths = Vec::new();
+        let mut success_count = 0;
+        let mut error_count = 0;
+        let mut errors = Vec::new();
+
+        for (idx, src_path) in paths.iter().enumerate() {
+            log::debug!("[{}/{}] 処理開始: {}", idx + 1, paths.len(), src_path.display());
+            let file_name = match src_path.file_name() {
+                Some(name) => name,
+                None => {
+                    log::error!("ファイル名の取得に失敗: {}", src_path.display());
+                    error_count += 1;
+                    errors.push(format!("ファイル名の取得に失敗: {}", src_path.display()));
+                    continue;
+                }
+            };
+
+            let mut dest_path = dest_dir.join(file_name);
+
+            if src_path == &dest_path {
+                dest_path = generate_copy_name(src_path, &dest_dir);
+            }
+
+            if dest_path.exists() && src_path != &dest_path {
+                log::warn!("「{}」は既に存在します。上書きします。", file_name.to_string_lossy());
+            }
+
+            let file_size = src_path.metadata()
+                .map(|m| m.len())
+                .unwrap_or(0);
+            let start_time = std::time::Instant::now();
+
+            match mode {
+                ClipboardMode::Copy => {
+                    log::debug!("コピー開始: {} -> {} (サイズ: {} bytes)",
+                        src_path.display(), dest_path.display(), file_size);
+                    if let Err(e) = file_manager.copy_recursive(src_path, &dest_path) {
+                        let elapsed = start_time.elapsed();
+                        log::error!("コピー失敗: {} (経過時間: {:?})", e, elapsed);
+                        error_count += 1;
+                        errors.push(format!("「{}」のコピーに失敗: {}", file_name.to_string_lossy(), e));
+                    } else {
+                        let elapsed = start_time.elapsed();
+                        log::info!("「{}」をコピーしました (サイズ: {} bytes, 時間: {:?})",
+                            file_name.to_string_lossy(), file_size, elapsed);
+                        pasted_paths.push(dest_path.clone());
+                        success_count += 1;
+                    }
+                }
+                ClipboardMode::Cut => {
+                    log::debug!("移動開始: {} -> {} (サイズ: {} bytes)",
+                        src_path.display(), dest_path.display(), file_size);
+                    if let Err(e) = file_manager.move_file(src_path, &dest_path) {
+                        let elapsed = start_time.elapsed();
+                        log::error!("移動失敗: {} (経過時間: {:?})", e, elapsed);
+                        error_count += 1;
+                        errors.push(format!("「{}」の移動に失敗: {}", file_name.to_string_lossy(), e));
+                    } else {
+                        let elapsed = start_time.elapsed();
+                        log::info!("「{}」を移動しました (サイズ: {} bytes, 時間: {:?})",
+                            file_name.to_string_lossy(), file_size, elapsed);
+                        pasted_paths.push(dest_path.clone());
+                        success_count += 1;
+                    }
+                }
+            }
+        }
+
+        // 切り取りモードで全て成功した場合のみクリップボードをクリア
+        if mode == ClipboardMode::Cut {
+            if error_count == 0 {
+                log::info!("Cutモード: 全てのファイル移動が成功したため、クリップボードをクリア");
+                self.state.clipboard_state.clear();
+            } else {
+                log::warn!("Cutモード: {}個のファイル移動に失敗したため、クリップボードを保持", error_count);
+            }
+        }
+
+        log::info!("=== ペースト実行完了 === 成功: {}, 失敗: {}", success_count, error_count);
+
+        // ペーストハイライトを設定
+        if !pasted_paths.is_empty() {
+            self.state.pasted_files_highlight = Some(crate::app::state::PastedFileHighlight::new(pasted_paths));
+            log::debug!("{}個のファイルをハイライト対象に設定しました", success_count);
+        }
+
+        // 結果メッセージを設定
+        let message = if error_count == 0 {
+            format!("{}個のファイルを{}しました", success_count, if mode == ClipboardMode::Copy { "コピー" } else { "移動" })
+        } else if success_count == 0 {
+            format!("すべてのファイルの{}に失敗しました:\n{}", if mode == ClipboardMode::Copy { "コピー" } else { "移動" }, errors.join("\n"))
+        } else {
+            format!("{}個のファイルを{}しましたが、{}個のファイルに失敗しました:\n{}",
+                success_count, if mode == ClipboardMode::Copy { "コピー" } else { "移動" }, error_count, errors.join("\n"))
+        };
+
+        let message_type = if error_count == 0 {
+            crate::app::state::MessageType::Success
+        } else if success_count == 0 {
+            crate::app::state::MessageType::Error
+        } else {
+            crate::app::state::MessageType::Warning
+        };
+
+        self.state.paste_result_message = Some(crate::app::state::PasteResultMessage::new(message, message_type));
+    }
+}
+
+impl eframe::App for OfktApp {
+    /// UIの更新
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // フレーム更新ログ（1秒ごとにカウンター表示）
+        use std::time::{Duration, Instant};
+        use std::sync::Mutex;
+        use lazy_static::lazy_static;
+
+        lazy_static! {
+            static ref LAST_LOG_TIME: Mutex<Option<Instant>> = Mutex::new(None);
+            static ref FRAME_COUNT: Mutex<u64> = Mutex::new(0);
+        }
+
+        {
+            let mut count = FRAME_COUNT.lock().unwrap();
+            *count += 1;
+
+            let mut last_time = LAST_LOG_TIME.lock().unwrap();
+            let now = Instant::now();
+
+            if last_time.is_none() || now.duration_since(last_time.unwrap()) >= Duration::from_secs(1) {
+                log::info!("Frame update count: {} frames", *count);
+                *last_time = Some(now);
+                *count = 0;
+            }
+        }
+
+        // ペーストハイライトの期限チェック
+        if let Some(ref highlight) = self.state.pasted_files_highlight {
+            if highlight.is_expired() {
+                self.state.pasted_files_highlight = None;
+                log::debug!("ペーストハイライトがタイムアウトしました");
+            }
+        }
+
+        // ユーザー操作によるクリア
+        if self.state.pasted_files_highlight.is_some() {
+            // 任意のキー押下でクリア
+            let any_key_pressed = ctx.input(|i| {
+                i.key_pressed(egui::Key::ArrowUp)
+                    || i.key_pressed(egui::Key::ArrowDown)
+                    || i.key_pressed(egui::Key::ArrowLeft)
+                    || i.key_pressed(egui::Key::ArrowRight)
+                    || i.key_pressed(egui::Key::Enter)
+                    || i.key_pressed(egui::Key::Escape)
+                    || i.key_pressed(egui::Key::Tab)
+                    || i.key_pressed(egui::Key::Backspace)
+            });
+
+            if any_key_pressed {
+                self.state.pasted_files_highlight = None;
+                log::debug!("キー操作によりペーストハイライトをクリアしました");
+            }
+
+            // マウスクリックでクリア
+            if ctx.input(|i| i.pointer.any_click()) {
+                self.state.pasted_files_highlight = None;
+                log::debug!("マウスクリックによりペーストハイライトをクリアしました");
+            }
+        }
+
+        // 遅延初期化（初回のみ実行）
+        if !self.state.is_initialized() {
+            if let Err(e) = self.state.lazy_initialize() {
+                log::error!("遅延初期化に失敗: {}", e);
+            }
+        }
+
+        // テーマを適用
+        self.apply_theme(ctx);
+
+        // グローバルホットキーイベントをポーリング
+        if self.state.hotkey_manager.handle_events() {
+            // イベント重複防止: 200ms以内の連続イベントを無視
+            let now = Instant::now();
+            let should_toggle = if let Some(last_time) = self.state.last_hotkey_time {
+                now.duration_since(last_time) > Duration::from_millis(200)
+            } else {
+                true
+            };
+
+            if should_toggle {
+                self.state.last_hotkey_time = Some(now);
+                log::info!("ホットキーが押されました: Ctrl+Shift+O");
+                self.toggle_window_visibility(ctx);
+            } else {
+                log::debug!("ホットキーイベントを重複として無視しました");
+            }
+        }
+
+        // システムトレイイベントをポーリング
+        if let Some(tray_event) = self.state.system_tray.handle_events() {
+            match tray_event {
+                TrayEvent::Open => {
+                    self.toggle_window_visibility(ctx);
+                }
+                TrayEvent::Settings => {
+                    log::info!("トレイメニュー「設定」が選択されました");
+                    // TODO: 設定画面を開く（将来実装）
+                }
+                TrayEvent::Exit => {
+                    log::info!("トレイメニュー「終了」が選択されました");
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            }
+        }
+
+        // Ctrl+Tabでエイリアス/ディレクトリモード切り替え
+        if ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::Tab)) {
+            self.state.browse_mode = match self.state.browse_mode {
+                BrowseMode::Alias => BrowseMode::Directory,
+                BrowseMode::Directory => BrowseMode::Alias,
+            };
+
+            // モード切り替え時にフォーカスをメインパネルに設定
+            self.state.current_focus_area = FocusArea::Main;
+
+            log::info!("モード切り替え: {:?}", self.state.browse_mode);
+        }
+
+        // ディレクトリモードに切り替えた時、DirectoryBrowserを初期化
+        if self.state.browse_mode == BrowseMode::Directory && self.state.directory_browser.is_none() {
+            if let Some(home_dir) = dirs::home_dir() {
+                if let Err(e) = self.state.init_directory_browser(home_dir) {
+                    log::error!("DirectoryBrowserの初期化に失敗: {}", e);
+                }
+            } else {
+                log::warn!("ホームディレクトリの取得に失敗");
+            }
+        }
+
+        // 共通のトップバー（タブバー）
+        egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
+            ui.heading("Ofkt - ファイル管理ツール");
+
+            ui.separator();
+
+            // モード切替タブバー
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut self.state.browse_mode, BrowseMode::Alias, "エイリアス");
+                ui.selectable_value(&mut self.state.browse_mode, BrowseMode::Directory, "ディレクトリ");
+            });
+        });
+
+        // モードに応じたUI表示
+        match self.state.browse_mode {
+            BrowseMode::Alias => {
+                // エイリアスモードUI
+                let mut central_panel = egui::CentralPanel::default();
+
+                // メインパネルにフォーカスがある場合は枠線を表示
+                if self.state.current_focus_area == FocusArea::Main {
+                    central_panel = central_panel.frame(egui::Frame {
+                        stroke: egui::Stroke::new(2.0, egui::Color32::from_rgb(100, 150, 255)),  // 青色の枠線
+                        ..Default::default()
+                    });
+                }
+
+                central_panel.show(ctx, |ui| {
+                    // Tabキーでフォーカス領域を切り替え（Ctrlなし）
+                    if ctx.input(|i| i.key_pressed(egui::Key::Tab) && !i.modifiers.shift && !i.modifiers.ctrl) {
+                        self.state.current_focus_area = match self.state.current_focus_area {
+                            FocusArea::Search => FocusArea::Sidebar,
+                            FocusArea::Sidebar => FocusArea::Main,
+                            FocusArea::Main => FocusArea::Search,
+                        };
+
+                        // 検索バーにフォーカスする場合はrequest_focus
+                        if self.state.current_focus_area == FocusArea::Search {
+                            self.search_bar.request_focus(ui.ctx());
+                        }
+                    }
+
+                    // Shift+Tabで逆方向に切り替え（Ctrlなし）
+                    if ctx.input(|i| i.key_pressed(egui::Key::Tab) && i.modifiers.shift && !i.modifiers.ctrl) {
+                        self.state.current_focus_area = match self.state.current_focus_area {
+                            FocusArea::Search => FocusArea::Main,
+                            FocusArea::Main => FocusArea::Sidebar,
+                            FocusArea::Sidebar => FocusArea::Search,
+                        };
+
+                        if self.state.current_focus_area == FocusArea::Search {
+                            self.search_bar.request_focus(ui.ctx());
+                        }
+                    }
+
+                    // Ctrl+Fで検索バーにフォーカス
+                    if ui.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::F)) {
+                        self.search_bar.request_focus(ui.ctx());
+                    }
+
+                    // 検索バー（エイリアス用）
+                    let search_event = self.search_bar.render(ui, &mut self.state.search_query);
+
+                    // フォーカス状態を更新
+                    self.state.search_bar_focused = search_event.has_focus;
+
+                    // 検索バーにフォーカスがある場合はFocusAreaを更新
+                    if search_event.has_focus {
+                        self.state.current_focus_area = FocusArea::Search;
+                    }
+
+                    if search_event.changed {
+                        if self.state.search_debouncer.should_search(&self.state.search_query) {
+                            self.state.filter_aliases();
+                        }
+                    }
+
+                    if search_event.cleared {
+                        // 検索がクリアされた場合は即座に全件表示
+                        self.state.filter_aliases();
+                    }
+
+                    if search_event.submitted {
+                        // Enterキーで即座に検索実行（デバウンスをバイパス）
+                        self.state.search_debouncer.force_search();
+                        self.state.filter_aliases();
+                    }
+
+                    // 検索バーで↓キーを押すと、最初の結果を選択
+                    if !self.state.filtered_items.is_empty()
+                        && self.state.selected_index.is_none()
+                        && ui.input(|i| i.key_pressed(egui::Key::ArrowDown))
+                    {
+                        self.state.selected_index = Some(0);
+                    }
+
+                    ui.separator();
+
+                    // 検索結果カウント
+                    let total_count = self.state.file_aliases.len();
+                    let filtered_count = self.state.filtered_items.len();
+
+                    if self.state.search_query.is_empty() {
+                        ui.label(format!("エイリアス: {} 件", total_count));
+                    } else {
+                        ui.label(format!("検索結果: {} / {} 件", filtered_count, total_count));
+                    }
+
+                    ui.separator();
+
+                    // エイリアス追加ボタン
+                    if ui.button("+ エイリアス追加").clicked() {
+                        self.state.show_add_alias_dialog = true;
+                        self.state.new_alias_name.clear();
+                        self.state.new_alias_path.clear();
+                    }
+
+                    ui.separator();
+
+                    // スクロール可能なエリアでファイルツリーを表示
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            // ファイルツリー
+                            // メインパネルにフォーカスがある場合のみハイライト表示
+                            let display_selected_index = if self.state.current_focus_area == FocusArea::Main {
+                                self.state.selected_index
+                            } else {
+                                None
+                            };
+
+                            if let Some(clicked_index) = self.file_tree.render(
+                                ui,
+                                &self.state.filtered_items,
+                                display_selected_index,
+                            ) {
+                                self.state.selected_index = Some(clicked_index);
+
+                                if let Some(alias) = self.state.filtered_items.get(clicked_index) {
+                                    if alias.path.is_dir() {
+                                        if let Err(e) = self.state.init_directory_browser(alias.path.clone()) {
+                                            log::error!("エイリアスパスへの移動に失敗: {}", e);
+                                        } else {
+                                            self.state.browse_mode = BrowseMode::Directory;
+                                            // 検索バーをクリア
+                                            self.state.search_query.clear();
+                                            self.state.selected_index = None;
+                                        }
+                                    } else {
+                                        let file_manager = FileManager::new();
+                                        if let Err(e) = file_manager.open(&alias.path) {
+                                            log::error!("ファイルを開けませんでした: {}", e);
+                                        }
+                                    }
+                                }
+                            }
+
+                            // クリック時のメニュー表示
+                            if self.state.selected_index.is_some() {
+                                // 右クリックでコンテキストメニューを表示
+                                ui.menu_button("操作", |ui| {
+                                    if ui.button("削除").clicked() {
+                                        // 選択されたエイリアスを削除
+                                        if let Some(idx) = self.state.selected_index {
+                                            if let Some(alias) = self.state.filtered_items.get(idx) {
+                                                let alias_id = alias.id.clone();
+                                                let alias_name = alias.alias.clone();
+
+                                                match self.state.alias_manager.remove_alias_by_id(&alias_id) {
+                                                    Ok(()) => {
+                                                        // 保存
+                                                        if let Err(e) = self.state.alias_manager.save() {
+                                                            log::error!("エイリアスの保存に失敗: {}", e);
+                                                        } else {
+                                                            // file_aliasesとfiltered_itemsを更新
+                                                            self.state.file_aliases = self.state.alias_manager.get_aliases().to_vec();
+                                                            self.state.filter_aliases();
+                                                            self.state.selected_index = None;
+                                                            log::info!("エイリアス「{}」を削除しました", alias_name);
+                                                        }
+                                                    }
+                                                    Err(e) => {
+                                                        log::error!("エイリアスの削除に失敗: {}", e);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        ui.close_menu();
+                                    }
+                                });
+                            }
+                        });
+                });
+
+                // ファイル操作用のキーボードショートカット（Ctrl+C/X/V）
+                // テキストフィールドにフォーカスがない場合のみ処理
+                let has_text_focus = ctx.memory(|mem| mem.focused().is_some());
+
+                // 生のイベントを確認
+                ctx.input(|i| {
+                    if i.modifiers.ctrl {
+                        for event in &i.events {
+                            if let egui::Event::Key { key, pressed, .. } = event {
+                                if *pressed {
+                                    log::info!("[ALIAS] Raw key event: {:?} (ctrl={})", key, i.modifiers.ctrl);
+                                }
+                            }
+                        }
+                    }
+                });
+
+                if !has_text_focus {
+                    // Ctrl+C: コピー (eventsから直接検出)
+                    let ctrl_c_pressed = ctx.input(|i| {
+                        i.modifiers.ctrl && i.events.iter().any(|e| {
+                            matches!(e, egui::Event::Key { key: egui::Key::C, pressed: true, .. })
+                        })
+                    });
+                    if ctrl_c_pressed {
+                        log::info!("[ALIAS] Ctrl+C detected! (focus={:?})", self.state.current_focus_area);
+                        if let Some(idx) = self.state.selected_index {
+                            if let Some(alias) = self.state.filtered_items.get(idx) {
+                                self.state.clipboard_state.copy(vec![alias.path.clone()]);
+                                log::info!("「{}」をコピーしました", alias.alias);
+                            } else {
+                                log::debug!("[ALIAS] selected_index is Some but alias not found");
+                            }
+                        } else {
+                            log::debug!("[ALIAS] selected_index is None");
+                        }
+                    }
+
+                    // Ctrl+X: 切り取り (eventsから直接検出)
+                    let ctrl_x_pressed = ctx.input(|i| {
+                        i.modifiers.ctrl && i.events.iter().any(|e| {
+                            matches!(e, egui::Event::Key { key: egui::Key::X, pressed: true, .. })
+                        })
+                    });
+                    if ctrl_x_pressed {
+                        log::info!("[ALIAS] Ctrl+X detected! (focus={:?})", self.state.current_focus_area);
+                        if let Some(idx) = self.state.selected_index {
+                            if let Some(alias) = self.state.filtered_items.get(idx) {
+                                self.state.clipboard_state.cut(vec![alias.path.clone()]);
+                                log::info!("「{}」を切り取りました", alias.alias);
+                            }
+                        }
+                    }
+
+                    // Ctrl+V: ペースト (eventsから直接検出)
+                    let ctrl_v_pressed = ctx.input(|i| {
+                        i.modifiers.ctrl && i.events.iter().any(|e| {
+                            matches!(e, egui::Event::Key { key: egui::Key::V, pressed: true, .. })
+                        })
+                    });
+                    if ctrl_v_pressed {
+                        log::info!("[ALIAS] Ctrl+V detected! (focus={:?})", self.state.current_focus_area);
+                        if !self.state.clipboard_state.is_empty() {
+                            if let Some(home_dir) = dirs::home_dir() {
+                                self.handle_paste_to_dir(home_dir);
+                            } else {
+                                log::error!("[ALIAS] Failed to get home directory");
+                            }
+                        } else {
+                            log::debug!("[ALIAS] clipboard_state is empty");
+                        }
+                    }
+                }
+
+                // エイリアスモードのキーイベント処理（統合）
+
+                // メインパネルにフォーカスがある場合のみキーイベント処理を実行
+                if self.state.current_focus_area == FocusArea::Main {
+                    if ctx.input(|i| i.key_pressed(egui::Key::ArrowDown)) {
+                        let max_index = self.state.filtered_items.len().saturating_sub(1);
+                        self.state.selected_index = Some(
+                            self.state.selected_index
+                                .map(|i| (i + 1).min(max_index))
+                                .unwrap_or(0)
+                        );
+                    }
+
+                    if ctx.input(|i| i.key_pressed(egui::Key::ArrowUp)) {
+                        self.state.selected_index = self.state.selected_index
+                            .and_then(|i| i.checked_sub(1));
+                    }
+
+                    if ctx.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        if let Some(idx) = self.state.selected_index {
+                            if let Some(alias) = self.state.filtered_items.get(idx) {
+                                if alias.path.is_dir() {
+                                    if let Err(e) = self.state.init_directory_browser(alias.path.clone()) {
+                                        log::error!("エイリアスパスへの移動に失敗: {}", e);
+                                    } else {
+                                        self.state.browse_mode = BrowseMode::Directory;
+                                        self.state.search_query.clear();
+                                        self.state.selected_index = None;
+                                    }
+                                } else {
+                                    let file_manager = FileManager::new();
+                                    if let Err(e) = file_manager.open(&alias.path) {
+                                        log::error!("ファイルを開けませんでした: {}", e);
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Ctrl+D: クイックアクセスに追加（エイリアスモード）
+                    if ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::D)) {
+                        if let Some(idx) = self.state.selected_index {
+                            if let Some(alias) = self.state.filtered_items.get(idx) {
+                                // 確認ダイアログを表示
+                                self.state.add_quick_access_dialog = Some(
+                                    crate::app::state::AddQuickAccessDialog::new(
+                                        alias.path.clone(),
+                                        alias.alias.clone()
+                                    )
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            BrowseMode::Directory => {
+                // サイドバー
+                let mut sidebar_panel = egui::SidePanel::left("drive_panel");
+
+                // サイドバーにフォーカスがある場合は枠線を表示
+                if self.state.current_focus_area == FocusArea::Sidebar {
+                    sidebar_panel = sidebar_panel.frame(egui::Frame {
+                        stroke: egui::Stroke::new(2.0, egui::Color32::from_rgb(100, 150, 255)),  // 青色の枠線
+                        ..Default::default()
+                    });
+                }
+
+                sidebar_panel.show(ctx, |ui| {
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            ui.heading("場所");
+                            ui.separator();
+
+                            // エイリアスセクション
+                            ui.label("エイリアス");
+
+                            // お気に入りエイリアスを優先表示
+                            let mut aliases = self.state.file_aliases.clone();
+                            aliases.sort_by(|a, b| {
+                                // お気に入りを優先、その後名前順
+                                match (b.is_favorite, a.is_favorite) {
+                                    (true, false) => std::cmp::Ordering::Greater,
+                                    (false, true) => std::cmp::Ordering::Less,
+                                    _ => a.alias.cmp(&b.alias),
+                                }
+                            });
+
+                            // 検索クエリでフィルタリング
+                            let filtered_aliases: Vec<_> = if self.state.directory_search_query.is_empty() {
+                                aliases
+                            } else {
+                                let query = self.state.directory_search_query.to_lowercase();
+                                aliases.into_iter()
+                                    .filter(|a| a.alias.to_lowercase().contains(&query))
+                                    .collect()
+                            };
+
+                            // エイリアスリストを表示（最大10件）
+                            let displayed_aliases: Vec<_> = filtered_aliases.iter().take(10).collect();
+                            let displayed_aliases_count = displayed_aliases.len();
+
+                            for (alias_index, alias) in displayed_aliases.iter().enumerate() {
+                                let button_text = if alias.is_favorite {
+                                    format!("⭐ {}", alias.alias)
+                                } else {
+                                    alias.alias.clone()
+                                };
+
+                                let button = egui::Button::new(&button_text)
+                                    .selected(self.state.current_focus_area == FocusArea::Sidebar
+                                        && self.state.selected_sidebar_index == Some(alias_index));
+
+                                if ui.add(button).clicked() {
+                                    // エイリアスのパスに移動
+                                    if let Err(e) = self.state.init_directory_browser(alias.path.clone()) {
+                                        log::error!("エイリアスパスへの移動に失敗: {}", e);
+                                    } else {
+                                        // 検索バーをクリア
+                                        self.state.directory_search_query.clear();
+                                        log::info!("エイリアス「{}」を開きました", alias.alias);
+                                    }
+                                }
+                            }
+
+                            ui.separator();
+
+                            // クイックアクセスセクション
+                            ui.label("クイックアクセス");
+
+                            // 借用エラーを避けるため、先にclone
+                            let quick_access_entries = self.state.quick_access_entries.clone();
+                            for (quick_access_index, entry) in quick_access_entries.iter().enumerate() {
+                                let sidebar_index = displayed_aliases_count + quick_access_index;
+
+                                let button_text = format!("{}", entry.name);
+                                let button = egui::Button::new(&button_text)
+                                    .selected(self.state.current_focus_area == FocusArea::Sidebar
+                                        && self.state.browse_mode == BrowseMode::Directory
+                                        && self.state.selected_sidebar_index == Some(sidebar_index));
+
+                                if ui.add(button).clicked() {
+                                    // クリック時の処理
+                                    if let Err(e) = self.state.init_directory_browser(entry.path.clone()) {
+                                        log::error!("ナビゲーション失敗: {}", e);
+                                    } else {
+                                        // 検索バーをクリア
+                                        self.state.directory_search_query.clear();
+                                    }
+                                }
+                            }
+
+                            ui.separator();
+
+                            // ドライブ
+                            ui.label("ドライブ");
+                            let drives = crate::platform::get_drives();
+                            for (drive_index, drive) in drives.iter().enumerate() {
+                                let sidebar_index = displayed_aliases_count + self.state.quick_access_entries.len() + drive_index;
+
+                                let icon = match drive.drive_type {
+                                    crate::platform::DriveType::Fixed => "💿",
+                                    crate::platform::DriveType::Removable => "💾",
+                                    crate::platform::DriveType::Network => "🌐",
+                                    _ => "📁",
+                                };
+
+                                let button = egui::Button::new(format!("{} {}", icon, drive.name))
+                                    .selected(self.state.current_focus_area == FocusArea::Sidebar
+                                        && self.state.selected_sidebar_index == Some(sidebar_index));
+
+                                if ui.add(button).clicked() {
+                                    if let Err(e) = self.state.init_directory_browser(drive.path.clone()) {
+                                        log::error!("ディレクトリブラウザ初期化失敗: {}", e);
+                                    } else {
+                                        // 検索バーをクリア
+                                        self.state.directory_search_query.clear();
+                                    }
+                                }
+                            }
+
+                            ui.separator();
+
+                            // WSL
+                            let wsl_dists = crate::platform::get_wsl_distributions();
+                            if !wsl_dists.is_empty() {
+                                ui.label("WSL");
+                                for (wsl_index, dist) in wsl_dists.iter().enumerate() {
+                                    let sidebar_index = displayed_aliases_count + self.state.quick_access_entries.len() + drives.len() + wsl_index;
+
+                                    let button = egui::Button::new(format!("🐧 {}", dist.name))
+                                        .selected(self.state.current_focus_area == FocusArea::Sidebar
+                                            && self.state.selected_sidebar_index == Some(sidebar_index));
+
+                                    if ui.add(button).clicked() {
+                                        if let Err(e) = self.state.init_directory_browser(dist.path.clone()) {
+                                            log::error!("ディレクトリブラウザ初期化失敗: {}", e);
+                                        } else {
+                                            // 検索バーをクリア
+                                            self.state.directory_search_query.clear();
+                                        }
+                                    }
+                                }
+                            }
+
+                            // サイドバーにフォーカスがある場合のキー操作（ctx.inputを使用）
+                            if self.state.current_focus_area == FocusArea::Sidebar {
+                                // サイドバーの項目数を計算
+                                let sidebar_items_count =
+                                    displayed_aliases_count  // エイリアスの数
+                                    + self.state.quick_access_entries.len()
+                                    + drives.len()
+                                    + wsl_dists.len();
+
+                                if sidebar_items_count > 0 {
+                                    if ctx.input(|i| i.key_pressed(egui::Key::ArrowDown)) {
+                                        let max_index = sidebar_items_count.saturating_sub(1);
+
+                                        match self.state.selected_sidebar_index {
+                                            Some(current_index) => {
+                                                if current_index >= max_index {
+                                                    // 最下部に達したらメインパネルにフォーカス移動
+                                                    self.state.current_focus_area = FocusArea::Main;
+                                                } else {
+                                                    // まだ下に項目があればインデックスを進める
+                                                    self.state.selected_sidebar_index = Some(current_index + 1);
+                                                }
+                                            }
+                                            None => {
+                                                // 未選択の場合は最初の項目を選択
+                                                self.state.selected_sidebar_index = Some(0);
+                                            }
+                                        }
+                                    }
+
+                                    if ctx.input(|i| i.key_pressed(egui::Key::ArrowUp)) {
+                                        self.state.selected_sidebar_index = self.state.selected_sidebar_index
+                                            .and_then(|i| i.checked_sub(1));
+                                    }
+
+                                    if ctx.input(|i| i.key_pressed(egui::Key::Enter)) {
+                                        if let Some(idx) = self.state.selected_sidebar_index {
+                                            // インデックスに応じて対応する項目を開く
+                                            let mut current_index = 0;
+
+                                            // エイリアスセクション
+                                            if idx < displayed_aliases_count {
+                                                if let Some(alias) = displayed_aliases.get(idx) {
+                                                    if let Err(e) = self.state.init_directory_browser(alias.path.clone()) {
+                                                        log::error!("エイリアスパスへの移動に失敗: {}", e);
+                                                    } else {
+                                                        self.state.directory_search_query.clear();
+                                                    }
+                                                }
+                                            } else {
+                                                current_index += displayed_aliases_count;
+
+                                                // クイックアクセスセクション
+                                                if idx < current_index + self.state.quick_access_entries.len() {
+                                                    let qa_idx = idx - current_index;
+                                                    if let Some(entry) = self.state.quick_access_entries.get(qa_idx) {
+                                                        if let Err(e) = self.state.init_directory_browser(entry.path.clone()) {
+                                                            log::error!("クイックアクセスへの移動に失敗: {}", e);
+                                                        } else {
+                                                            self.state.directory_search_query.clear();
+                                                        }
+                                                    }
+                                                } else {
+                                                    current_index += self.state.quick_access_entries.len();
+
+                                                    // ドライブセクション
+                                                    if idx < current_index + drives.len() {
+                                                        let drive_idx = idx - current_index;
+                                                        if let Some(drive) = drives.get(drive_idx) {
+                                                            if let Err(e) = self.state.init_directory_browser(drive.path.clone()) {
+                                                                log::error!("ドライブへの移動に失敗: {}", e);
+                                                            } else {
+                                                                self.state.directory_search_query.clear();
+                                                            }
+                                                        }
+                                                    } else {
+                                                        current_index += drives.len();
+
+                                                        // WSLセクション
+                                                        if idx < current_index + wsl_dists.len() {
+                                                            let wsl_idx = idx - current_index;
+                                                            if let Some(dist) = wsl_dists.get(wsl_idx) {
+                                                                if let Err(e) = self.state.init_directory_browser(dist.path.clone()) {
+                                                                    log::error!("WSL分布版への移動に失敗: {}", e);
+                                                                } else {
+                                                                    self.state.directory_search_query.clear();
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        });
+                });
+
+                // メインパネル
+                let mut central_panel = egui::CentralPanel::default();
+
+                // メインパネルにフォーカスがある場合は枠線を表示
+                if self.state.current_focus_area == FocusArea::Main {
+                    central_panel = central_panel.frame(egui::Frame {
+                        stroke: egui::Stroke::new(2.0, egui::Color32::from_rgb(100, 150, 255)),  // 青色の枠線
+                        ..Default::default()
+                    });
+                }
+
+                central_panel.show(ctx, |ui| {
+                    // Tabキーでフォーカス領域を切り替え（Ctrlなし）
+                    // ディレクトリモード: 検索→メイン→サイド
+                    if ctx.input(|i| i.key_pressed(egui::Key::Tab) && !i.modifiers.shift && !i.modifiers.ctrl) {
+                        self.state.current_focus_area = match self.state.current_focus_area {
+                            FocusArea::Search => FocusArea::Main,      // 検索 → メイン
+                            FocusArea::Main => FocusArea::Sidebar,     // メイン → サイド
+                            FocusArea::Sidebar => FocusArea::Search,   // サイド → 検索
+                        };
+
+                        if self.state.current_focus_area == FocusArea::Search {
+                            self.search_bar.request_focus(ui.ctx());
+                        }
+                    }
+
+                    // Shift+Tabで逆方向に切り替え（Ctrlなし）
+                    // ディレクトリモード: 検索←メイン←サイド
+                    if ctx.input(|i| i.key_pressed(egui::Key::Tab) && i.modifiers.shift && !i.modifiers.ctrl) {
+                        self.state.current_focus_area = match self.state.current_focus_area {
+                            FocusArea::Search => FocusArea::Sidebar,   // 検索 ← サイド
+                            FocusArea::Sidebar => FocusArea::Main,     // サイド ← メイン
+                            FocusArea::Main => FocusArea::Search,      // メイン ← 検索
+                        };
+
+                        if self.state.current_focus_area == FocusArea::Search {
+                            self.search_bar.request_focus(ui.ctx());
+                        }
+                    }
+
+                    // Ctrl+Fで検索バーにフォーカス
+                    if ui.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::F)) {
+                        self.search_bar.request_focus(ui.ctx());
+                    }
+
+                    // 検索バー（ディレクトリ用）
+                    let dir_search_event = self.search_bar.render(ui, &mut self.state.directory_search_query);
+
+                    // フォーカス状態を更新
+                    self.state.directory_search_bar_focused = dir_search_event.has_focus;
+
+                    // 検索バーにフォーカスがある場合はFocusAreaを更新
+                    if dir_search_event.has_focus {
+                        self.state.current_focus_area = FocusArea::Search;
+                    }
+
+                    if dir_search_event.changed || dir_search_event.cleared || dir_search_event.submitted {
+                        // 検索クエリ変更時のログ
+                        log::debug!("ディレクトリ検索: {}", self.state.directory_search_query);
+                    }
+
+                    ui.separator();
+
+                    if self.state.directory_browser.is_some() {
+                        let entries = self.state.get_current_entries();
+
+                        // 検索クエリでフィルタリング
+                        let filtered_entries: Vec<_> = if self.state.directory_search_query.is_empty() {
+                            entries
+                        } else {
+                            let query = self.state.directory_search_query.to_lowercase();
+                            entries.into_iter()
+                                .filter(|e| e.name.to_lowercase().contains(&query))
+                                .collect()
+                        };
+
+                        // 現在のパス表示
+                        let current_path = self.state.directory_browser.as_ref().unwrap().current_path().to_path_buf();
+                        ui.label(format!("パス: {}", current_path.display()));
+
+                        // ナビゲーションボタンの状態を取得
+                        let can_back = self.state.directory_browser.as_ref().unwrap().can_go_back();
+                        let can_forward = self.state.directory_browser.as_ref().unwrap().can_go_forward();
+
+                        // 戻る/進む/親フォルダボタン
+                        ui.horizontal(|ui| {
+                            if ui.add_enabled(can_back, egui::Button::new("← 戻る")).clicked() {
+                                if let Err(e) = self.state.directory_browser.as_mut().unwrap().go_back() {
+                                    log::error!("戻るに失敗: {}", e);
+                                } else {
+                                    // 検索バーをクリア
+                                    self.state.directory_search_query.clear();
+                                }
+                            }
+                            if ui.add_enabled(can_forward, egui::Button::new("進む →")).clicked() {
+                                if let Err(e) = self.state.directory_browser.as_mut().unwrap().go_forward() {
+                                    log::error!("進むに失敗: {}", e);
+                                } else {
+                                    // 検索バーをクリア
+                                    self.state.directory_search_query.clear();
+                                }
+                            }
+                            if ui.button("親フォルダ ↑").clicked() {
+                                if let Err(e) = self.state.directory_browser.as_mut().unwrap().parent() {
+                                    log::error!("親フォルダへの移動に失敗: {}", e);
+                                } else {
+                                    // 検索バーをクリア
+                                    self.state.directory_search_query.clear();
+                                }
+                            }
+                        });
+
+                        ui.separator();
+
+                        // フィルタリングされたエントリ数を表示
+                        ui.label(format!("エントリ: {} 件", filtered_entries.len()));
+
+                        ui.separator();
+
+                        // ファイル操作用のキーボードショートカット（Ctrl+C/X/V）
+                        // テキストフィールドにフォーカスがない場合のみ処理
+                        let has_text_focus = ctx.memory(|mem| mem.focused().is_some());
+
+                        // 生のイベントを確認
+                        ctx.input(|i| {
+                            if i.modifiers.ctrl {
+                                for event in &i.events {
+                                    if let egui::Event::Key { key, pressed, .. } = event {
+                                        if *pressed {
+                                            log::info!("[DIRECTORY] Raw key event: {:?} (ctrl={})", key, i.modifiers.ctrl);
+                                        }
+                                    }
+                                }
+                            }
+                        });
+
+                        if !has_text_focus {
+                            // Ctrl+C: コピー (eventsから直接検出)
+                            let ctrl_c_pressed = ctx.input(|i| {
+                                i.modifiers.ctrl && i.events.iter().any(|e| {
+                                    matches!(e, egui::Event::Key { key: egui::Key::C, pressed: true, .. })
+                                })
+                            });
+                            if ctrl_c_pressed {
+                                log::info!("[DIRECTORY] Ctrl+C detected! (focus={:?})", self.state.current_focus_area);
+                                if let Some(idx) = self.state.selected_directory_index {
+                                    if let Some(entry) = filtered_entries.get(idx) {
+                                        self.state.clipboard_state.copy(vec![entry.path.clone()]);
+                                        log::info!("「{}」をコピーしました", entry.name);
+                                    } else {
+                                        log::debug!("[DIRECTORY] selected_directory_index is Some but entry not found");
+                                    }
+                                } else {
+                                    log::debug!("[DIRECTORY] selected_directory_index is None");
+                                }
+                            }
+
+                            // Ctrl+X: 切り取り (eventsから直接検出)
+                            let ctrl_x_pressed = ctx.input(|i| {
+                                i.modifiers.ctrl && i.events.iter().any(|e| {
+                                    matches!(e, egui::Event::Key { key: egui::Key::X, pressed: true, .. })
+                                })
+                            });
+                            if ctrl_x_pressed {
+                                log::info!("[DIRECTORY] Ctrl+X detected! (focus={:?})", self.state.current_focus_area);
+                                if let Some(idx) = self.state.selected_directory_index {
+                                    if let Some(entry) = filtered_entries.get(idx) {
+                                        self.state.clipboard_state.cut(vec![entry.path.clone()]);
+                                        log::info!("「{}」を切り取りました", entry.name);
+                                    }
+                                }
+                            }
+
+                            // Ctrl+V: ペースト (eventsから直接検出)
+                            let ctrl_v_pressed = ctx.input(|i| {
+                                i.modifiers.ctrl && i.events.iter().any(|e| {
+                                    matches!(e, egui::Event::Key { key: egui::Key::V, pressed: true, .. })
+                                })
+                            });
+                            if ctrl_v_pressed {
+                                log::info!("[DIRECTORY] Ctrl+V detected! (focus={:?})", self.state.current_focus_area);
+                                if !self.state.clipboard_state.is_empty() {
+                                    if self.state.directory_browser.is_some() {
+                                        self.handle_paste();
+                                    }
+                                } else {
+                                    log::debug!("[DIRECTORY] clipboard_state is empty");
+                                }
+                            }
+                        }
+
+                        // キーボード操作処理は render_directory_tree() の後に移動
+                        // （total_items を使用するため）
+
+                        // メインパネルにフォーカスがある場合のみキーイベント処理を実行
+                        if self.state.current_focus_area == FocusArea::Main {
+                            if ctx.input(|i| i.key_pressed(egui::Key::Enter)) {
+                                if let Some(idx) = self.state.selected_directory_index {
+                                    if let Some(entry) = filtered_entries.get(idx) {
+                                        if entry.is_directory {
+                                            // ディレクトリの場合は移動
+                                            if let Err(e) = self.state.directory_browser.as_mut().unwrap().navigate_to(entry.path.clone()) {
+                                                log::error!("ディレクトリの移動に失敗: {}", e);
+                                            } else {
+                                                // 検索バーをクリア
+                                                self.state.directory_search_query.clear();
+                                            }
+                                        } else {
+                                            // ファイルの場合は開く
+                                            let file_manager = FileManager::new();
+                                            if let Err(e) = file_manager.open(&entry.path) {
+                                                log::error!("ファイルを開くのに失敗: {}", e);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            // Backspaceキー（検索バーフォーカス時はスキップ）
+                            if !self.state.directory_search_bar_focused
+                                && ctx.input(|i| i.key_pressed(egui::Key::Backspace))
+                            {
+                                if let Err(e) = self.state.directory_browser.as_mut().unwrap().parent() {
+                                    log::error!("親フォルダへの移動に失敗: {}", e);
+                                } else {
+                                    // 検索バーをクリア
+                                    self.state.directory_search_query.clear();
+                                }
+                            }
+                            if ctx.input(|i| i.modifiers.alt && i.key_pressed(egui::Key::ArrowLeft)) {
+                                if let Err(e) = self.state.directory_browser.as_mut().unwrap().go_back() {
+                                    log::error!("戻るに失敗: {}", e);
+                                } else {
+                                    // 検索バーをクリア
+                                    self.state.directory_search_query.clear();
+                                }
+                            }
+                            if ctx.input(|i| i.modifiers.alt && i.key_pressed(egui::Key::ArrowRight)) {
+                                if let Err(e) = self.state.directory_browser.as_mut().unwrap().go_forward() {
+                                    log::error!("進むに失敗: {}", e);
+                                } else {
+                                    // 検索バーをクリア
+                                    self.state.directory_search_query.clear();
+                                }
+                            }
+
+                            // 右キー: ディレクトリ展開（Alt+ArrowRightと競合しないようにチェック）
+                            if ctx.input(|i| i.key_pressed(egui::Key::ArrowRight) && !i.modifiers.alt) {
+                                if let Some(idx) = self.state.selected_directory_index {
+                                    if let Some(entry) = filtered_entries.get(idx) {
+                                        if entry.is_directory && !self.state.expanded_directories.contains(&entry.path) {
+                                            self.state.expanded_directories.insert(entry.path.clone());
+                                            log::debug!("ディレクトリ展開: {}", entry.path.display());
+                                        }
+                                    }
+                                }
+                            }
+
+                            // 左キー: ディレクトリ折りたたみ/親選択（Alt+ArrowLeftと競合しないようにチェック）
+                            if ctx.input(|i| i.key_pressed(egui::Key::ArrowLeft) && !i.modifiers.alt) {
+                                if let Some(idx) = self.state.selected_directory_index {
+                                    if let Some(entry) = filtered_entries.get(idx) {
+                                        if entry.is_directory {
+                                            if self.state.expanded_directories.contains(&entry.path) {
+                                                // 展開されている場合は折りたたみ
+                                                self.state.expanded_directories.remove(&entry.path);
+                                                log::debug!("ディレクトリ折りたたみ: {}", entry.path.display());
+                                            } else {
+                                                // 折りたたまれている場合は親ディレクトリを選択
+                                                if let Some(parent_path) = entry.path.parent() {
+                                                    // 親パスがフィルタに含まれるか確認
+                                                    if let Some(parent_idx) = filtered_entries.iter().position(|e| {
+                                                        use crate::utils::path::paths_equal;
+                                                        paths_equal(&e.path, parent_path)
+                                                    }) {
+                                                        self.state.selected_directory_index = Some(parent_idx);
+                                                        log::debug!("親ディレクトリ選択: {}", parent_path.display());
+                                                    } else {
+                                                        // 親がフィルタに含まれない場合、検索をクリア
+                                                        if !self.state.directory_search_query.is_empty() {
+                                                            log::warn!("親ディレクトリがフィルタに含まれていないため、検索をクリアします");
+                                                            self.state.directory_search_query.clear();
+
+                                                            // 警告メッセージを表示
+                                                            self.state.paste_result_message = Some(
+                                                                crate::app::state::PasteResultMessage::new(
+                                                                    format!("親ディレクトリ「{}」は検索結果に含まれていないため、検索をクリアしました",
+                                                                        parent_path.display()),
+                                                                    crate::app::state::MessageType::Warning
+                                                                )
+                                                            );
+
+                                                            // ディレクトリブラウザをリロードして全エントリを表示
+                                                            if let Some(ref mut browser) = self.state.directory_browser {
+                                                                if let Err(e) = browser.reload() {
+                                                                    log::error!("ディレクトリリロード失敗: {}", e);
+                                                                } else {
+                                                                    // リロード後、親ディレクトリを検索して選択
+                                                                    let entries = browser.entries();
+                                                                    if let Some(parent_idx) = entries.iter().position(|e| {
+                                                                        use crate::utils::path::paths_equal;
+                                                                        paths_equal(&e.path, parent_path)
+                                                                    }) {
+                                                                        self.state.selected_directory_index = Some(parent_idx);
+                                                                    }
+                                                                }
+                                                            }
+                                                        } else {
+                                                            // 検索していないのに親が見つからない場合（通常起こらない）
+                                                            log::error!("親ディレクトリが見つかりません: {}", parent_path.display());
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            // Ctrl+D: クイックアクセスに追加（確認ダイアログを表示）
+                            if ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::D)) {
+                                if let Some(idx) = self.state.selected_directory_index {
+                                    if let Some(entry) = filtered_entries.get(idx) {
+                                        if entry.is_directory {
+                                            // 確認ダイアログを表示
+                                            self.state.add_quick_access_dialog = Some(
+                                                crate::app::state::AddQuickAccessDialog::new(
+                                                    entry.path.clone(),
+                                                    entry.name.clone()
+                                                )
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        // スクロール可能なエリアでファイルツリーを表示
+                        egui::ScrollArea::vertical()
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                // ファイルツリー表示（filtered_entriesを使用）
+                                // メインパネルにフォーカスがある場合のみハイライト表示
+                                let display_selected_index = if self.state.current_focus_area == FocusArea::Main {
+                                    self.state.selected_directory_index
+                                } else {
+                                    None
+                                };
+
+                                let (clicked_path, is_right_click, total_items) = self.file_tree.render_directory_tree(
+                                    ui,
+                                    &filtered_entries,
+                                    &mut self.state.expanded_directories,
+                                    display_selected_index,
+                                    self.state.pasted_files_highlight.as_ref()
+                                );
+
+                                // キーボードナビゲーション（ArrowDown/ArrowUp）
+                                // total_items（展開されたツリー全体）を使用
+                                if self.state.current_focus_area == FocusArea::Main {
+                                    if ctx.input(|i| i.key_pressed(egui::Key::ArrowDown)) {
+                                        let max_index = total_items.saturating_sub(1);
+                                        self.state.selected_directory_index = Some(
+                                            self.state.selected_directory_index.map(|i| (i + 1).min(max_index)).unwrap_or(0)
+                                        );
+                                    }
+                                    if ctx.input(|i| i.key_pressed(egui::Key::ArrowUp)) {
+                                        self.state.selected_directory_index = self.state.selected_directory_index.and_then(|i| i.checked_sub(1));
+                                    }
+                                }
+
+                                // クリック処理（filtered_entriesを使用）
+                                if let Some(path) = clicked_path {
+                                    // パスからインデックスを検索
+                                    self.state.selected_directory_index = filtered_entries.iter()
+                                        .position(|e| paths_equal(&e.path, &path));
+
+                                    if is_right_click {
+                                        // 右クリックの場合、コンテキストメニューを表示
+                                        if let Some(entry) = filtered_entries.iter().find(|e| paths_equal(&e.path, &path)) {
+                                            ui.menu_button("操作", |ui| {
+                                                if let Some(action) = ContextMenu::show_for_directory_entry(ui, entry) {
+                                                    // アクションを処理
+                                                    let file_manager = FileManager::new();
+                                                    match action {
+                                                        MenuAction::Open => {
+                                                            if let Err(e) = file_manager.open(&entry.path) {
+                                                                log::error!("開くに失敗: {}", e);
+                                                            }
+                                                        }
+                                                        MenuAction::Delete => {
+                                                            // 確認ダイアログを表示すべき（将来実装）
+                                                            if let Err(e) = file_manager.delete(&entry.path, false) {
+                                                                log::error!("削除に失敗: {}", e);
+                                                            }
+                                                        }
+                                                        MenuAction::Properties => {
+                                                            log::info!("プロパティ: {:?}", entry);
+                                                        }
+                                                        _ => {
+                                                            log::info!("未実装のアクション: {:?}", action);
+                                                        }
+                                                    }
+                                                }
+                                            });
+                                        }
+                                    } else if let Some(entry) = filtered_entries.iter().find(|e| paths_equal(&e.path, &path)) {
+                                        // 左クリックの場合、既存の動作
+                                        if entry.is_directory {
+                                            // ディレクトリをクリックで移動
+                                            if let Err(e) = self.state.directory_browser.as_mut().unwrap().navigate_to(entry.path.clone()) {
+                                                log::error!("ディレクトリの移動に失敗: {}", e);
+                                            } else {
+                                                // 検索バーをクリア
+                                                self.state.directory_search_query.clear();
+                                            }
+                                        } else {
+                                            // ファイルをクリックで開く
+                                            let file_manager = FileManager::new();
+                                            if let Err(e) = file_manager.open(&entry.path) {
+                                                log::error!("ファイルを開くのに失敗: {}", e);
+                                            }
+                                        }
+                                    }
+                                }
+                            });
+                    } else {
+                        ui.label("ディレクトリブラウザが初期化されていません");
+                    }
+                });
+            }
+        }
+
+        // エイリアス追加ダイアログ
+        if self.state.show_add_alias_dialog {
+            egui::Window::new("エイリアス追加")
+                .collapsible(false)
+                .resizable(false)
+                .show(ctx, |ui| {
+                    ui.label("エイリアス名:");
+                    ui.text_edit_singleline(&mut self.state.new_alias_name);
+
+                    ui.label("パス:");
+                    ui.horizontal(|ui| {
+                        ui.text_edit_singleline(&mut self.state.new_alias_path);
+                        if ui.button("...").clicked() {
+                            // ディレクトリ選択ダイアログ（将来実装）
+                            log::info!("ディレクトリ選択ダイアログ（未実装）");
+                        }
+                    });
+
+                    ui.separator();
+
+                    ui.horizontal(|ui| {
+                        if ui.button("追加").clicked() {
+                            // バリデーション
+                            if self.state.new_alias_name.is_empty() {
+                                log::warn!("エイリアス名が空です");
+                            } else if self.state.new_alias_path.is_empty() {
+                                log::warn!("パスが空です");
+                            } else {
+                                // エイリアスを追加
+                                match self.state.alias_manager.add_alias(
+                                    self.state.new_alias_name.clone(),
+                                    std::path::PathBuf::from(&self.state.new_alias_path),
+                                    vec![],
+                                    None,
+                                    false,
+                                ) {
+                                    Ok(()) => {
+                                        // 保存
+                                        if let Err(e) = self.state.alias_manager.save() {
+                                            log::error!("エイリアスの保存に失敗: {}", e);
+                                        } else {
+                                            // file_aliasesとfiltered_itemsを更新
+                                            self.state.file_aliases = self.state.alias_manager.get_aliases().to_vec();
+                                            self.state.filter_aliases();
+                                            log::info!("エイリアス「{}」を追加しました", self.state.new_alias_name);
+                                            self.state.show_add_alias_dialog = false;
+                                        }
+                                    }
+                                    Err(e) => {
+                                        log::error!("エイリアスの追加に失敗: {}", e);
+                                    }
+                                }
+                            }
+                        }
+
+                        if ui.button("キャンセル").clicked() {
+                            self.state.show_add_alias_dialog = false;
+                        }
+                    });
+                });
+        }
+
+        // ペースト結果メッセージの表示
+        if let Some(ref msg) = self.state.paste_result_message {
+            if msg.is_expired() {
+                self.state.paste_result_message = None;
+            } else {
+                let title = match msg.message_type {
+                    crate::app::state::MessageType::Success => "✓ 成功",
+                    crate::app::state::MessageType::Error => "✗ エラー",
+                    crate::app::state::MessageType::Warning => "⚠ 警告",
+                };
+
+                let message_clone = msg.message.clone();
+                let mut open = true;
+                let mut should_close = false;
+                egui::Window::new(title)
+                    .open(&mut open)
+                    .resizable(false)
+                    .collapsible(false)
+                    .show(ctx, |ui| {
+                        ui.label(&message_clone);
+                        ui.add_space(10.0);
+                        if ui.button("OK").clicked() {
+                            should_close = true;
+                        }
+                    });
+
+                if !open || should_close {
+                    self.state.paste_result_message = None;
+                }
+            }
+        }
+
+        // 上書き確認ダイアログ
+        if let Some(ref dialog) = self.state.overwrite_confirmation_dialog {
+            log::debug!("上書き確認ダイアログを描画中: {} 個のファイル", dialog.files.len());
+            let mut should_close = false;
+            let mut should_proceed = false;
+
+            egui::Window::new("⚠ 上書き確認")
+                .resizable(false)
+                .collapsible(false)
+                .show(ctx, |ui| {
+                    ui.label(format!("{}個のファイルが既に存在します。上書きしますか？", dialog.files.len()));
+                    ui.add_space(10.0);
+
+                    // ファイル一覧（最大5件表示）
+                    for (_i, file) in dialog.files.iter().take(5).enumerate() {
+                        ui.label(format!("• {}", file.file_name().unwrap_or_default().to_string_lossy()));
+                    }
+                    if dialog.files.len() > 5 {
+                        ui.label(format!("...他{}個", dialog.files.len() - 5));
+                    }
+
+                    ui.add_space(10.0);
+
+                    ui.horizontal(|ui| {
+                        if ui.button("上書きする").clicked() {
+                            log::info!("上書き確認: ユーザーが「上書きする」を選択");
+                            should_proceed = true;
+                            should_close = true;
+                        }
+                        if ui.button("キャンセル").clicked() {
+                            log::info!("上書き確認: ユーザーが「キャンセル」を選択");
+                            should_close = true;
+                        }
+                    });
+                });
+
+            if should_proceed {
+                log::info!("上書き確認後、ペースト処理を実行");
+                let pending = dialog.pending_paste.clone();
+                self.state.overwrite_confirmation_dialog = None;
+                // 実際のペースト処理を実行（上書きを許可）
+                self.execute_paste_operation(pending);
+
+                // ディレクトリをリロード
+                if let Some(ref mut browser) = self.state.directory_browser {
+                    if let Err(e) = browser.reload() {
+                        log::error!("ディレクトリリロード失敗: {}", e);
+                    }
+                }
+            } else if should_close {
+                self.state.overwrite_confirmation_dialog = None;
+            }
+        }
+
+        // クイックアクセス追加確認ダイアログ
+        if let Some(ref mut dialog) = self.state.add_quick_access_dialog {
+            let mut should_close = false;
+            let mut should_add = false;
+
+            egui::Window::new("クイックアクセスに追加")
+                .resizable(false)
+                .collapsible(false)
+                .show(ctx, |ui| {
+                    ui.label("フォルダをクイックアクセスに追加しますか？");
+                    ui.add_space(10.0);
+
+                    ui.horizontal(|ui| {
+                        ui.label("名前:");
+                        ui.text_edit_singleline(&mut dialog.name);
+                    });
+
+                    ui.horizontal(|ui| {
+                        ui.label("パス:");
+                        ui.label(dialog.path.display().to_string());
+                    });
+
+                    ui.add_space(10.0);
+
+                    ui.horizontal(|ui| {
+                        if ui.button("追加").clicked() {
+                            should_add = true;
+                            should_close = true;
+                        }
+                        if ui.button("キャンセル").clicked() {
+                            should_close = true;
+                        }
+                    });
+                });
+
+            if should_add {
+                // クイックアクセスに追加
+                let name = dialog.name.clone();
+                let path = dialog.path.clone();
+
+                match self.state.add_to_quick_access(name.clone(), path.clone()) {
+                    Ok(_) => {
+                        log::info!("「{}」をクイックアクセスに追加しました", name);
+
+                        // 成功メッセージを表示
+                        self.state.paste_result_message = Some(
+                            crate::app::state::PasteResultMessage::new(
+                                format!("「{}」をクイックアクセスに追加しました", name),
+                                crate::app::state::MessageType::Success
+                            )
+                        );
+                    }
+                    Err(e) => {
+                        log::error!("クイックアクセスへの追加に失敗: {}", e);
+
+                        // エラーメッセージを表示
+                        self.state.paste_result_message = Some(
+                            crate::app::state::PasteResultMessage::new(
+                                format!("クイックアクセスへの追加に失敗しました: {}", e),
+                                crate::app::state::MessageType::Error
+                            )
+                        );
+                    }
+                }
+            }
+
+            if should_close {
+                self.state.add_quick_access_dialog = None;
+            }
+        }
+
+        // 非アクティブ時でもホットキーを検出できるように定期的に再描画をリクエスト
+        ctx.request_repaint_after(Duration::from_millis(100));
+    }
+
+    /// アプリケーション終了時の保存処理
+    fn save(&mut self, _storage: &mut dyn eframe::Storage) {
+        info!("アプリケーション終了");
+    }
+}

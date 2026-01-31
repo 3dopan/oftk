@@ -1,0 +1,27 @@
+# Rust関連
+/target
+Cargo.lock
+**/*.rs.bk
+*.pdb
+
+# ログファイル
+*.log
+logs/
+
+# IDE固有
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS固有
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ビルド成果物
+*.exe
+*.dll
+*.so
+*.dylib

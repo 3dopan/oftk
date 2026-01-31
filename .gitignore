@@ -1,0 +1,14 @@
+# IDE
+.vs/
+.vscode/
+.idea/
+
+# Logs
+*.log
+
+# Build artifacts
+/ofkt/target/
+
+# OS files
+.DS_Store
+Thumbs.db
