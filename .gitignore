@@ -12,3 +12,16 @@
 # OS files
 .DS_Store
 Thumbs.db
+
+# Development reports (keep locally, exclude from git)
+ofkt/TASK_*.md
+ofkt/PHASE_*.md
+ofkt/PROJECT_COMPLETE.md
+ofkt/OPTIMIZATION_REPORT.md
+ofkt/BUGFIX_LOG.md
+ofkt/BENCHMARK_SETUP.md
+ofkt/TEST_COVERAGE.md
+ofkt/INTEGRATION_TEST.md
+ofkt/docs/HOTKEY_INTEGRATION_TEST_REPORT.md
+IMPLEMENTATION_REPORT_*.md
+docs/
