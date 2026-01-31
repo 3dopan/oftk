@@ -141,18 +141,8 @@ impl OfktApp {
         }
 
         // 3. 書き込み権限の確認
-        if dest_dir.exists() {
-            if let Ok(metadata) = dest_dir.metadata() {
-                if metadata.permissions().readonly() {
-                    log::debug!("書き込み権限確認: NG - 読み取り専用: {}", dest_dir.display());
-                    validation_errors.push(format!("コピー先ディレクトリ「{}」は読み取り専用です", dest_dir.display()));
-                } else {
-                    log::debug!("書き込み権限確認: OK - 書き込み可能: {}", dest_dir.display());
-                }
-            } else {
-                log::debug!("書き込み権限確認: 警告 - メタデータ取得失敗");
-            }
-        }
+        // Windows互換性のため、readonly()チェックをスキップし、実行時エラーで判定
+        log::debug!("書き込み権限確認: スキップ（Windows互換性のため実行時チェック）");
 
         // 4. ディスク容量の推定確認（簡易版）
         // 注: 正確な実装はfs2クレートなどが必要
@@ -357,6 +347,62 @@ impl eframe::App for OfktApp {
                 *last_time = Some(now);
                 *count = 0;
             }
+        }
+
+        // Ctrl+C/X/V の検出
+        // ファイルが選択されている場合はファイル操作を優先
+        let has_file_selection = match self.state.browse_mode {
+            BrowseMode::Alias => self.state.selected_index.is_some(),
+            BrowseMode::Directory => self.state.selected_directory_index.is_some(),
+        };
+
+        // egui::Eventを直接チェックする方式（Windows互換性のため）
+        let mut copy_pressed = false;
+        let mut cut_pressed = false;
+        let mut paste_pressed = false;
+
+        ctx.input(|i| {
+            for event in &i.events {
+                match event {
+                    egui::Event::Key { key, pressed: true, modifiers, .. } => {
+                        if modifiers.ctrl {
+                            match key {
+                                egui::Key::C => copy_pressed = true,
+                                egui::Key::X => cut_pressed = true,
+                                egui::Key::V => paste_pressed = true,
+                                _ => {}
+                            }
+                        }
+                    }
+                    egui::Event::Copy => copy_pressed = true,
+                    egui::Event::Cut => cut_pressed = true,
+                    egui::Event::Paste(_) => paste_pressed = true,
+                    _ => {}
+                }
+            }
+        });
+
+        if copy_pressed {
+            log::debug!("[KEYBOARD] Copy event detected (browse_mode={:?}, has_selection={})", self.state.browse_mode, has_file_selection);
+        }
+        if cut_pressed {
+            log::debug!("[KEYBOARD] Cut event detected (browse_mode={:?}, has_selection={})", self.state.browse_mode, has_file_selection);
+        }
+        if paste_pressed {
+            log::debug!("[KEYBOARD] Paste event detected (browse_mode={:?}, has_selection={})", self.state.browse_mode, has_file_selection);
+        }
+
+        if copy_pressed && has_file_selection {
+            log::info!("[KEYBOARD] Ctrl+C detected! (browse_mode={:?})", self.state.browse_mode);
+            self.state.pending_file_copy = true;
+        }
+        if cut_pressed && has_file_selection {
+            log::info!("[KEYBOARD] Ctrl+X detected! (browse_mode={:?})", self.state.browse_mode);
+            self.state.pending_file_cut = true;
+        }
+        if paste_pressed {
+            log::info!("[KEYBOARD] Ctrl+V detected! (browse_mode={:?})", self.state.browse_mode);
+            self.state.pending_file_paste = true;
         }
 
         // ペーストハイライトの期限チェック
@@ -658,76 +704,48 @@ impl eframe::App for OfktApp {
                 });
 
                 // ファイル操作用のキーボードショートカット（Ctrl+C/X/V）
-                // テキストフィールドにフォーカスがない場合のみ処理
-                let has_text_focus = ctx.memory(|mem| mem.focused().is_some());
+                // pending_file_copy/cut/paste フラグを使用（update()の最初で設定される）
 
-                // 生のイベントを確認
-                ctx.input(|i| {
-                    if i.modifiers.ctrl {
-                        for event in &i.events {
-                            if let egui::Event::Key { key, pressed, .. } = event {
-                                if *pressed {
-                                    log::info!("[ALIAS] Raw key event: {:?} (ctrl={})", key, i.modifiers.ctrl);
-                                }
-                            }
-                        }
-                    }
-                });
-
-                if !has_text_focus {
-                    // Ctrl+C: コピー (eventsから直接検出)
-                    let ctrl_c_pressed = ctx.input(|i| {
-                        i.modifiers.ctrl && i.events.iter().any(|e| {
-                            matches!(e, egui::Event::Key { key: egui::Key::C, pressed: true, .. })
-                        })
-                    });
-                    if ctrl_c_pressed {
-                        log::info!("[ALIAS] Ctrl+C detected! (focus={:?})", self.state.current_focus_area);
-                        if let Some(idx) = self.state.selected_index {
-                            if let Some(alias) = self.state.filtered_items.get(idx) {
-                                self.state.clipboard_state.copy(vec![alias.path.clone()]);
-                                log::info!("「{}」をコピーしました", alias.alias);
-                            } else {
-                                log::debug!("[ALIAS] selected_index is Some but alias not found");
-                            }
+                // Ctrl+C: コピー (pending_file_copyフラグを使用)
+                if self.state.pending_file_copy {
+                    self.state.pending_file_copy = false;
+                    log::info!("[ALIAS] Ctrl+C処理開始 (focus={:?})", self.state.current_focus_area);
+                    if let Some(idx) = self.state.selected_index {
+                        if let Some(alias) = self.state.filtered_items.get(idx) {
+                            self.state.clipboard_state.copy(vec![alias.path.clone()]);
+                            log::info!("「{}」をコピーしました", alias.alias);
                         } else {
-                            log::debug!("[ALIAS] selected_index is None");
+                            log::debug!("[ALIAS] selected_index is Some but alias not found");
+                        }
+                    } else {
+                        log::debug!("[ALIAS] selected_index is None");
+                    }
+                }
+
+                // Ctrl+X: 切り取り (pending_file_cutフラグを使用)
+                if self.state.pending_file_cut {
+                    self.state.pending_file_cut = false;
+                    log::info!("[ALIAS] Ctrl+X処理開始 (focus={:?})", self.state.current_focus_area);
+                    if let Some(idx) = self.state.selected_index {
+                        if let Some(alias) = self.state.filtered_items.get(idx) {
+                            self.state.clipboard_state.cut(vec![alias.path.clone()]);
+                            log::info!("「{}」を切り取りました", alias.alias);
                         }
                     }
+                }
 
-                    // Ctrl+X: 切り取り (eventsから直接検出)
-                    let ctrl_x_pressed = ctx.input(|i| {
-                        i.modifiers.ctrl && i.events.iter().any(|e| {
-                            matches!(e, egui::Event::Key { key: egui::Key::X, pressed: true, .. })
-                        })
-                    });
-                    if ctrl_x_pressed {
-                        log::info!("[ALIAS] Ctrl+X detected! (focus={:?})", self.state.current_focus_area);
-                        if let Some(idx) = self.state.selected_index {
-                            if let Some(alias) = self.state.filtered_items.get(idx) {
-                                self.state.clipboard_state.cut(vec![alias.path.clone()]);
-                                log::info!("「{}」を切り取りました", alias.alias);
-                            }
-                        }
-                    }
-
-                    // Ctrl+V: ペースト (eventsから直接検出)
-                    let ctrl_v_pressed = ctx.input(|i| {
-                        i.modifiers.ctrl && i.events.iter().any(|e| {
-                            matches!(e, egui::Event::Key { key: egui::Key::V, pressed: true, .. })
-                        })
-                    });
-                    if ctrl_v_pressed {
-                        log::info!("[ALIAS] Ctrl+V detected! (focus={:?})", self.state.current_focus_area);
-                        if !self.state.clipboard_state.is_empty() {
-                            if let Some(home_dir) = dirs::home_dir() {
-                                self.handle_paste_to_dir(home_dir);
-                            } else {
-                                log::error!("[ALIAS] Failed to get home directory");
-                            }
+                // Ctrl+V: ペースト (pending_file_pasteフラグを使用)
+                if self.state.pending_file_paste {
+                    self.state.pending_file_paste = false;
+                    log::info!("[ALIAS] Ctrl+V処理開始 (focus={:?})", self.state.current_focus_area);
+                    if !self.state.clipboard_state.is_empty() {
+                        if let Some(home_dir) = dirs::home_dir() {
+                            self.handle_paste_to_dir(home_dir);
                         } else {
-                            log::debug!("[ALIAS] clipboard_state is empty");
+                            log::error!("[ALIAS] Failed to get home directory");
                         }
+                    } else {
+                        log::debug!("[ALIAS] clipboard_state is empty");
                     }
                 }
 
@@ -1047,6 +1065,84 @@ impl eframe::App for OfktApp {
                 }
 
                 central_panel.show(ctx, |ui| {
+                    // ファイル操作用のキーボードショートカット（Ctrl+C/X/V）
+                    // pending_file_copy/cut/paste フラグを使用（update()の最初で設定される）
+                    // 重要: これらの処理は directory_browser の有無に関わらずフラグをリセットする必要がある
+
+                    // Ctrl+C: コピー (pending_file_copyフラグを使用)
+                    if self.state.pending_file_copy {
+                        self.state.pending_file_copy = false;
+                        log::info!("[DIRECTORY] Ctrl+C処理開始 (focus={:?})", self.state.current_focus_area);
+                        if let Some(ref browser) = self.state.directory_browser {
+                            let entries = self.state.get_current_entries();
+                            // 検索クエリでフィルタリング
+                            let filtered_entries: Vec<_> = if self.state.directory_search_query.is_empty() {
+                                entries
+                            } else {
+                                let query = self.state.directory_search_query.to_lowercase();
+                                entries.into_iter()
+                                    .filter(|e| e.name.to_lowercase().contains(&query))
+                                    .collect()
+                            };
+                            log::debug!("[DEBUG] selected_directory_index={:?}", self.state.selected_directory_index);
+                            if let Some(idx) = self.state.selected_directory_index {
+                                if let Some(entry) = filtered_entries.get(idx) {
+                                    self.state.clipboard_state.copy(vec![entry.path.clone()]);
+                                    log::info!("「{}」をコピーしました", entry.name);
+                                } else {
+                                    log::debug!("[DIRECTORY] selected_directory_index is Some but entry not found");
+                                }
+                            } else {
+                                log::debug!("[DIRECTORY] selected_directory_index is None");
+                            }
+                            let _ = browser; // 借用を明示的に終了
+                        } else {
+                            log::warn!("[DIRECTORY] Ctrl+C: ディレクトリブラウザが初期化されていません");
+                        }
+                    }
+
+                    // Ctrl+X: 切り取り (pending_file_cutフラグを使用)
+                    if self.state.pending_file_cut {
+                        self.state.pending_file_cut = false;
+                        log::info!("[DIRECTORY] Ctrl+X処理開始 (focus={:?})", self.state.current_focus_area);
+                        if let Some(ref browser) = self.state.directory_browser {
+                            let entries = self.state.get_current_entries();
+                            // 検索クエリでフィルタリング
+                            let filtered_entries: Vec<_> = if self.state.directory_search_query.is_empty() {
+                                entries
+                            } else {
+                                let query = self.state.directory_search_query.to_lowercase();
+                                entries.into_iter()
+                                    .filter(|e| e.name.to_lowercase().contains(&query))
+                                    .collect()
+                            };
+                            if let Some(idx) = self.state.selected_directory_index {
+                                if let Some(entry) = filtered_entries.get(idx) {
+                                    self.state.clipboard_state.cut(vec![entry.path.clone()]);
+                                    log::info!("「{}」を切り取りました", entry.name);
+                                }
+                            }
+                            let _ = browser; // 借用を明示的に終了
+                        } else {
+                            log::warn!("[DIRECTORY] Ctrl+X: ディレクトリブラウザが初期化されていません");
+                        }
+                    }
+
+                    // Ctrl+V: ペースト (pending_file_pasteフラグを使用)
+                    if self.state.pending_file_paste {
+                        self.state.pending_file_paste = false;
+                        log::info!("[DIRECTORY] Ctrl+V処理開始 (focus={:?})", self.state.current_focus_area);
+                        if !self.state.clipboard_state.is_empty() {
+                            if self.state.directory_browser.is_some() {
+                                self.handle_paste();
+                            } else {
+                                log::warn!("[DIRECTORY] Ctrl+V: ディレクトリブラウザが初期化されていません");
+                            }
+                        } else {
+                            log::debug!("[DIRECTORY] clipboard_state is empty");
+                        }
+                    }
+
                     // Tabキーでフォーカス領域を切り替え（Ctrlなし）
                     // ディレクトリモード: 検索→メイン→サイド
                     if ctx.input(|i| i.key_pressed(egui::Key::Tab) && !i.modifiers.shift && !i.modifiers.ctrl) {
@@ -1153,81 +1249,6 @@ impl eframe::App for OfktApp {
                         ui.label(format!("エントリ: {} 件", filtered_entries.len()));
 
                         ui.separator();
-
-                        // ファイル操作用のキーボードショートカット（Ctrl+C/X/V）
-                        // テキストフィールドにフォーカスがない場合のみ処理
-                        let has_text_focus = ctx.memory(|mem| mem.focused().is_some());
-
-                        // 生のイベントを確認
-                        ctx.input(|i| {
-                            if i.modifiers.ctrl {
-                                for event in &i.events {
-                                    if let egui::Event::Key { key, pressed, .. } = event {
-                                        if *pressed {
-                                            log::info!("[DIRECTORY] Raw key event: {:?} (ctrl={})", key, i.modifiers.ctrl);
-                                        }
-                                    }
-                                }
-                            }
-                        });
-
-                        if !has_text_focus {
-                            // Ctrl+C: コピー (eventsから直接検出)
-                            let ctrl_c_pressed = ctx.input(|i| {
-                                i.modifiers.ctrl && i.events.iter().any(|e| {
-                                    matches!(e, egui::Event::Key { key: egui::Key::C, pressed: true, .. })
-                                })
-                            });
-                            if ctrl_c_pressed {
-                                log::info!("[DIRECTORY] Ctrl+C detected! (focus={:?})", self.state.current_focus_area);
-                                if let Some(idx) = self.state.selected_directory_index {
-                                    if let Some(entry) = filtered_entries.get(idx) {
-                                        self.state.clipboard_state.copy(vec![entry.path.clone()]);
-                                        log::info!("「{}」をコピーしました", entry.name);
-                                    } else {
-                                        log::debug!("[DIRECTORY] selected_directory_index is Some but entry not found");
-                                    }
-                                } else {
-                                    log::debug!("[DIRECTORY] selected_directory_index is None");
-                                }
-                            }
-
-                            // Ctrl+X: 切り取り (eventsから直接検出)
-                            let ctrl_x_pressed = ctx.input(|i| {
-                                i.modifiers.ctrl && i.events.iter().any(|e| {
-                                    matches!(e, egui::Event::Key { key: egui::Key::X, pressed: true, .. })
-                                })
-                            });
-                            if ctrl_x_pressed {
-                                log::info!("[DIRECTORY] Ctrl+X detected! (focus={:?})", self.state.current_focus_area);
-                                if let Some(idx) = self.state.selected_directory_index {
-                                    if let Some(entry) = filtered_entries.get(idx) {
-                                        self.state.clipboard_state.cut(vec![entry.path.clone()]);
-                                        log::info!("「{}」を切り取りました", entry.name);
-                                    }
-                                }
-                            }
-
-                            // Ctrl+V: ペースト (eventsから直接検出)
-                            let ctrl_v_pressed = ctx.input(|i| {
-                                i.modifiers.ctrl && i.events.iter().any(|e| {
-                                    matches!(e, egui::Event::Key { key: egui::Key::V, pressed: true, .. })
-                                })
-                            });
-                            if ctrl_v_pressed {
-                                log::info!("[DIRECTORY] Ctrl+V detected! (focus={:?})", self.state.current_focus_area);
-                                if !self.state.clipboard_state.is_empty() {
-                                    if self.state.directory_browser.is_some() {
-                                        self.handle_paste();
-                                    }
-                                } else {
-                                    log::debug!("[DIRECTORY] clipboard_state is empty");
-                                }
-                            }
-                        }
-
-                        // キーボード操作処理は render_directory_tree() の後に移動
-                        // （total_items を使用するため）
 
                         // メインパネルにフォーカスがある場合のみキーイベント処理を実行
                         if self.state.current_focus_area == FocusArea::Main {
@@ -1531,7 +1552,19 @@ impl eframe::App for OfktApp {
 
         // ペースト結果メッセージの表示
         if let Some(ref msg) = self.state.paste_result_message {
-            if msg.is_expired() {
+            // 表示から500ms経過後、任意のキー押下で閉じる
+            let can_dismiss = msg.timestamp.elapsed() > std::time::Duration::from_millis(500);
+            let any_key_pressed = ctx.input(|i| {
+                i.key_pressed(egui::Key::Enter)
+                    || i.key_pressed(egui::Key::Escape)
+                    || i.key_pressed(egui::Key::Space)
+                    || i.key_pressed(egui::Key::ArrowUp)
+                    || i.key_pressed(egui::Key::ArrowDown)
+                    || i.key_pressed(egui::Key::ArrowLeft)
+                    || i.key_pressed(egui::Key::ArrowRight)
+            });
+
+            if msg.is_expired() || (can_dismiss && any_key_pressed) {
                 self.state.paste_result_message = None;
             } else {
                 let title = match msg.message_type {
