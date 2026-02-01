@@ -171,6 +171,13 @@ pub struct AppState {
 
     /// 上書き確認ダイアログの状態
     pub overwrite_confirmation_dialog: Option<OverwriteConfirmationDialog>,
+
+    /// Ctrl+C が押されたフラグ
+    pub pending_file_copy: bool,
+    /// Ctrl+X が押されたフラグ
+    pub pending_file_cut: bool,
+    /// Ctrl+V が押されたフラグ
+    pub pending_file_paste: bool,
 }
 
 /// クイックアクセス追加確認ダイアログ
@@ -286,6 +293,9 @@ impl Default for AppState {
             paste_result_message: None,
             add_quick_access_dialog: None,
             overwrite_confirmation_dialog: None,
+            pending_file_copy: false,
+            pending_file_cut: false,
+            pending_file_paste: false,
         }
     }
 }
