@@ -1,6 +1,7 @@
 use crate::core::alias::AliasManager;
 use crate::core::clipboard::ClipboardState;
 use crate::core::directory_browser::DirectoryBrowser;
+use crate::core::operation_history::OperationHistoryManager;
 use crate::core::quick_access::QuickAccessManager;
 use crate::core::search::SearchEngine;
 use crate::data::models::{Config, FileAlias, QuickAccessEntry};
@@ -9,6 +10,7 @@ use crate::platform::SystemTray;
 use crate::ui::search_bar::SearchDebouncer;
 use crate::ui::theme::Theme;
 use crate::utils::path::paths_equal;
+use egui;
 use global_hotkey::hotkey::{Code, Modifiers};
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -166,11 +168,26 @@ pub struct AppState {
     /// ペースト操作の結果メッセージ
     pub paste_result_message: Option<PasteResultMessage>,
 
+    /// 操作結果メッセージ（汎用）
+    pub operation_result_message: Option<OperationResultMessage>,
+
     /// クイックアクセス追加確認ダイアログの状態
     pub add_quick_access_dialog: Option<AddQuickAccessDialog>,
 
     /// 上書き確認ダイアログの状態
     pub overwrite_confirmation_dialog: Option<OverwriteConfirmationDialog>,
+
+    /// 削除確認ダイアログの状態
+    pub delete_confirmation_dialog: Option<DeleteConfirmationDialog>,
+
+    /// リネームダイアログの状態
+    pub rename_dialog: Option<RenameDialog>,
+
+    /// プロパティダイアログの状態
+    pub properties_dialog: Option<PropertiesDialog>,
+
+    /// コンテキストメニューの状態
+    pub context_menu_state: Option<ContextMenuState>,
 
     /// Ctrl+C が押されたフラグ
     pub pending_file_copy: bool,
@@ -178,6 +195,9 @@ pub struct AppState {
     pub pending_file_cut: bool,
     /// Ctrl+V が押されたフラグ
     pub pending_file_paste: bool,
+
+    /// 操作履歴マネージャー（Undo/Redo用）
+    pub operation_history: OperationHistoryManager,
 }
 
 /// クイックアクセス追加確認ダイアログ
@@ -215,6 +235,106 @@ pub struct PendingPasteOperation {
     pub mode: crate::core::clipboard::ClipboardMode,
 }
 
+/// 削除確認ダイアログ
+#[derive(Debug, Clone)]
+pub struct DeleteConfirmationDialog {
+    /// 削除対象のファイル/フォルダパス
+    pub paths: Vec<PathBuf>,
+    /// 完全削除（true）かゴミ箱移動（false）か
+    pub permanent: bool,
+    /// 表示用名前リスト
+    pub display_names: Vec<String>,
+}
+
+impl DeleteConfirmationDialog {
+    pub fn new(paths: Vec<PathBuf>) -> Self {
+        let display_names = paths.iter()
+            .map(|p| p.file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| p.display().to_string()))
+            .collect();
+        Self {
+            paths,
+            permanent: false,
+            display_names,
+        }
+    }
+}
+
+/// リネームダイアログ
+#[derive(Debug, Clone)]
+pub struct RenameDialog {
+    /// リネーム対象のパス
+    pub path: PathBuf,
+    /// 新しい名前（編集用）
+    pub new_name: String,
+    /// 元の名前
+    pub original_name: String,
+}
+
+impl RenameDialog {
+    pub fn new(path: PathBuf) -> Self {
+        let original_name = path.file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        Self {
+            path,
+            new_name: original_name.clone(),
+            original_name,
+        }
+    }
+}
+
+/// プロパティダイアログ
+#[derive(Debug, Clone)]
+pub struct PropertiesDialog {
+    pub path: PathBuf,
+    pub name: String,
+    pub size: u64,
+    pub is_directory: bool,
+    pub is_readonly: bool,
+    pub modified: Option<std::time::SystemTime>,
+    pub created: Option<std::time::SystemTime>,
+}
+
+/// コンテキストメニューの状態
+#[derive(Debug, Clone)]
+pub struct ContextMenuState {
+    /// メニューを表示する位置
+    pub position: egui::Pos2,
+    /// 対象のエントリ情報
+    pub entry_path: PathBuf,
+    pub entry_name: String,
+    pub is_directory: bool,
+}
+
+impl ContextMenuState {
+    pub fn new(position: egui::Pos2, path: PathBuf, name: String, is_directory: bool) -> Self {
+        Self {
+            position,
+            entry_path: path,
+            entry_name: name,
+            is_directory,
+        }
+    }
+}
+
+impl PropertiesDialog {
+    pub fn new(path: PathBuf) -> Self {
+        let name = path.file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let metadata = std::fs::metadata(&path).ok();
+        let size = metadata.as_ref().map(|m| m.len()).unwrap_or(0);
+        let is_directory = path.is_dir();
+        let is_readonly = metadata.as_ref().map(|m| m.permissions().readonly()).unwrap_or(false);
+        let modified = metadata.as_ref().and_then(|m| m.modified().ok());
+        let created = metadata.as_ref().and_then(|m| m.created().ok());
+
+        Self { path, name, size, is_directory, is_readonly, modified, created }
+    }
+}
+
 /// ペースト操作の結果
 #[derive(Debug, Clone)]
 pub struct PasteResultMessage {
@@ -245,6 +365,56 @@ impl PasteResultMessage {
     /// メッセージが期限切れか（5秒経過）
     pub fn is_expired(&self) -> bool {
         self.timestamp.elapsed() > Duration::from_secs(5)
+    }
+}
+
+/// 操作結果メッセージ（汎用）
+#[derive(Debug, Clone)]
+pub struct OperationResultMessage {
+    /// メッセージテキスト
+    pub message: String,
+    /// メッセージタイプ
+    pub message_type: MessageType,
+    /// メッセージが表示された時刻
+    pub timestamp: Instant,
+    /// 表示期間
+    pub duration: Duration,
+}
+
+impl OperationResultMessage {
+    /// 成功メッセージを作成（3秒表示）
+    pub fn success(message: String) -> Self {
+        Self {
+            message,
+            message_type: MessageType::Success,
+            timestamp: Instant::now(),
+            duration: Duration::from_secs(3),
+        }
+    }
+
+    /// エラーメッセージを作成（5秒表示）
+    pub fn error(message: String) -> Self {
+        Self {
+            message,
+            message_type: MessageType::Error,
+            timestamp: Instant::now(),
+            duration: Duration::from_secs(5),
+        }
+    }
+
+    /// 警告メッセージを作成（4秒表示）
+    pub fn warning(message: String) -> Self {
+        Self {
+            message,
+            message_type: MessageType::Warning,
+            timestamp: Instant::now(),
+            duration: Duration::from_secs(4),
+        }
+    }
+
+    /// メッセージが期限切れかチェック
+    pub fn is_expired(&self) -> bool {
+        self.timestamp.elapsed() > self.duration
     }
 }
 
@@ -291,11 +461,17 @@ impl Default for AppState {
             quick_access_entries: Vec::new(),
             pasted_files_highlight: None,
             paste_result_message: None,
+            operation_result_message: None,
             add_quick_access_dialog: None,
             overwrite_confirmation_dialog: None,
+            delete_confirmation_dialog: None,
+            rename_dialog: None,
+            properties_dialog: None,
+            context_menu_state: None,
             pending_file_copy: false,
             pending_file_cut: false,
             pending_file_paste: false,
+            operation_history: OperationHistoryManager::new(),
         }
     }
 }

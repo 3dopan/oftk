@@ -405,6 +405,58 @@ impl eframe::App for OfktApp {
             self.state.pending_file_paste = true;
         }
 
+        // Ctrl+Z: Undo
+        let undo_pressed = ctx.input(|i| {
+            i.events.iter().any(|e| {
+                matches!(e, egui::Event::Key { key: egui::Key::Z, pressed: true, modifiers, .. } if modifiers.ctrl && !modifiers.shift)
+            })
+        });
+
+        // Ctrl+Y または Ctrl+Shift+Z: Redo
+        let redo_pressed = ctx.input(|i| {
+            i.events.iter().any(|e| {
+                matches!(e, egui::Event::Key { key: egui::Key::Y, pressed: true, modifiers, .. } if modifiers.ctrl)
+                    || matches!(e, egui::Event::Key { key: egui::Key::Z, pressed: true, modifiers, .. } if modifiers.ctrl && modifiers.shift)
+            })
+        });
+
+        if undo_pressed {
+            match self.state.operation_history.undo() {
+                Ok(msg) => {
+                    self.state.operation_result_message = Some(
+                        crate::app::state::OperationResultMessage::success(msg)
+                    );
+                    // ディレクトリをリロード
+                    if let Some(ref mut browser) = self.state.directory_browser {
+                        let _ = browser.reload();
+                    }
+                }
+                Err(msg) => {
+                    self.state.operation_result_message = Some(
+                        crate::app::state::OperationResultMessage::warning(msg)
+                    );
+                }
+            }
+        }
+
+        if redo_pressed {
+            match self.state.operation_history.redo() {
+                Ok(msg) => {
+                    self.state.operation_result_message = Some(
+                        crate::app::state::OperationResultMessage::success(msg)
+                    );
+                    if let Some(ref mut browser) = self.state.directory_browser {
+                        let _ = browser.reload();
+                    }
+                }
+                Err(msg) => {
+                    self.state.operation_result_message = Some(
+                        crate::app::state::OperationResultMessage::warning(msg)
+                    );
+                }
+            }
+        }
+
         // ペーストハイライトの期限チェック
         if let Some(ref highlight) = self.state.pasted_files_highlight {
             if highlight.is_expired() {
@@ -722,6 +774,11 @@ impl eframe::App for OfktApp {
                         if let Some(alias) = self.state.filtered_items.get(idx) {
                             self.state.clipboard_state.copy(vec![alias.path.clone()]);
                             log::info!("「{}」をコピーしました", alias.alias);
+                            self.state.operation_result_message = Some(
+                                crate::app::state::OperationResultMessage::success(
+                                    format!("「{}」をコピーしました", alias.alias)
+                                )
+                            );
                         } else {
                             log::debug!("[ALIAS] selected_index is Some but alias not found");
                         }
@@ -738,6 +795,11 @@ impl eframe::App for OfktApp {
                         if let Some(alias) = self.state.filtered_items.get(idx) {
                             self.state.clipboard_state.cut(vec![alias.path.clone()]);
                             log::info!("「{}」を切り取りました", alias.alias);
+                            self.state.operation_result_message = Some(
+                                crate::app::state::OperationResultMessage::success(
+                                    format!("「{}」を切り取りました", alias.alias)
+                                )
+                            );
                         }
                     }
                 }
@@ -759,8 +821,17 @@ impl eframe::App for OfktApp {
 
                 // エイリアスモードのキーイベント処理（統合）
 
+                // ダイアログ表示中かどうかをチェック
+                let dialog_open = self.state.delete_confirmation_dialog.is_some()
+                    || self.state.rename_dialog.is_some()
+                    || self.state.properties_dialog.is_some()
+                    || self.state.overwrite_confirmation_dialog.is_some()
+                    || self.state.add_quick_access_dialog.is_some()
+                    || self.state.show_add_alias_dialog;
+
                 // メインパネルにフォーカスがある場合のみキーイベント処理を実行
-                if self.state.current_focus_area == FocusArea::Main {
+                // ダイアログ表示中はキー入力をスキップ
+                if self.state.current_focus_area == FocusArea::Main && !dialog_open {
                     if ctx.input(|i| i.key_pressed(egui::Key::ArrowDown)) {
                         let max_index = self.state.filtered_items.len().saturating_sub(1);
                         self.state.selected_index = Some(
@@ -1097,6 +1168,11 @@ impl eframe::App for OfktApp {
                                 if let Some(entry) = filtered_entries.get(idx) {
                                     self.state.clipboard_state.copy(vec![entry.path.clone()]);
                                     log::info!("「{}」をコピーしました", entry.name);
+                                    self.state.operation_result_message = Some(
+                                        crate::app::state::OperationResultMessage::success(
+                                            format!("「{}」をコピーしました", entry.name)
+                                        )
+                                    );
                                 } else {
                                     log::debug!("[DIRECTORY] selected_directory_index is Some but entry not found");
                                 }
@@ -1128,6 +1204,11 @@ impl eframe::App for OfktApp {
                                 if let Some(entry) = filtered_entries.get(idx) {
                                     self.state.clipboard_state.cut(vec![entry.path.clone()]);
                                     log::info!("「{}」を切り取りました", entry.name);
+                                    self.state.operation_result_message = Some(
+                                        crate::app::state::OperationResultMessage::success(
+                                            format!("「{}」を切り取りました", entry.name)
+                                        )
+                                    );
                                 }
                             }
                             let _ = browser; // 借用を明示的に終了
@@ -1258,8 +1339,17 @@ impl eframe::App for OfktApp {
 
                         ui.separator();
 
+                        // ダイアログ表示中かどうかをチェック
+                        let dialog_open = self.state.delete_confirmation_dialog.is_some()
+                            || self.state.rename_dialog.is_some()
+                            || self.state.properties_dialog.is_some()
+                            || self.state.overwrite_confirmation_dialog.is_some()
+                            || self.state.add_quick_access_dialog.is_some()
+                            || self.state.show_add_alias_dialog;
+
                         // メインパネルにフォーカスがある場合のみキーイベント処理を実行
-                        if self.state.current_focus_area == FocusArea::Main {
+                        // ダイアログ表示中はキー入力をスキップ
+                        if self.state.current_focus_area == FocusArea::Main && !dialog_open {
                             if ctx.input(|i| i.key_pressed(egui::Key::Enter)) {
                                 if let Some(idx) = self.state.selected_directory_index {
                                     if let Some(entry) = filtered_entries.get(idx) {
@@ -1441,33 +1531,17 @@ impl eframe::App for OfktApp {
                                         .position(|e| paths_equal(&e.path, path));
 
                                     if is_right_click {
-                                        // 右クリックの場合、コンテキストメニューを表示
+                                        // 右クリックの場合、コンテキストメニュー状態を設定
                                         if let Some(entry) = filtered_entries.iter().find(|e| paths_equal(&e.path, path)) {
-                                            ui.menu_button("操作", |ui| {
-                                                if let Some(action) = ContextMenu::show_for_directory_entry(ui, entry) {
-                                                    // アクションを処理
-                                                    let file_manager = FileManager::new();
-                                                    match action {
-                                                        MenuAction::Open => {
-                                                            if let Err(e) = file_manager.open(&entry.path) {
-                                                                log::error!("開くに失敗: {}", e);
-                                                            }
-                                                        }
-                                                        MenuAction::Delete => {
-                                                            // 確認ダイアログを表示すべき（将来実装）
-                                                            if let Err(e) = file_manager.delete(&entry.path, false) {
-                                                                log::error!("削除に失敗: {}", e);
-                                                            }
-                                                        }
-                                                        MenuAction::Properties => {
-                                                            log::info!("プロパティ: {:?}", entry);
-                                                        }
-                                                        _ => {
-                                                            log::info!("未実装のアクション: {:?}", action);
-                                                        }
-                                                    }
-                                                }
-                                            });
+                                            let pointer_pos = ctx.input(|i| i.pointer.hover_pos().unwrap_or(egui::Pos2::ZERO));
+                                            self.state.context_menu_state = Some(
+                                                crate::app::state::ContextMenuState::new(
+                                                    pointer_pos,
+                                                    entry.path.clone(),
+                                                    entry.name.clone(),
+                                                    entry.is_directory,
+                                                )
+                                            );
                                         }
                                     }
                                 }
@@ -1606,6 +1680,29 @@ impl eframe::App for OfktApp {
             }
         }
 
+        // 操作結果メッセージの表示
+        if let Some(ref msg) = self.state.operation_result_message {
+            if msg.is_expired() {
+                self.state.operation_result_message = None;
+            } else {
+                let color = match msg.message_type {
+                    crate::app::state::MessageType::Success => egui::Color32::from_rgb(200, 255, 200),
+                    crate::app::state::MessageType::Error => egui::Color32::from_rgb(255, 200, 200),
+                    crate::app::state::MessageType::Warning => egui::Color32::from_rgb(255, 255, 200),
+                };
+
+                let message_clone = msg.message.clone();
+                egui::Window::new("操作結果")
+                    .collapsible(false)
+                    .resizable(false)
+                    .anchor(egui::Align2::CENTER_TOP, [0.0, 50.0])
+                    .frame(egui::Frame::window(&ctx.style()).fill(color))
+                    .show(ctx, |ui| {
+                        ui.label(&message_clone);
+                    });
+            }
+        }
+
         // 上書き確認ダイアログ
         if let Some(ref dialog) = self.state.overwrite_confirmation_dialog {
             log::debug!("上書き確認ダイアログを描画中: {} 個のファイル", dialog.files.len());
@@ -1728,6 +1825,343 @@ impl eframe::App for OfktApp {
 
             if should_close {
                 self.state.add_quick_access_dialog = None;
+            }
+        }
+
+        // 削除確認ダイアログの表示
+        if let Some(ref dialog) = self.state.delete_confirmation_dialog {
+            let dialog_clone = dialog.clone();
+            egui::Window::new("削除の確認")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    ui.vertical(|ui| {
+                        // 削除対象の表示
+                        ui.label("以下を削除しますか？");
+                        ui.add_space(8.0);
+
+                        for (i, name) in dialog_clone.display_names.iter().enumerate() {
+                            if i < 5 {
+                                ui.label(format!("  - {}", name));
+                            } else if i == 5 {
+                                ui.label(format!("  ...他 {} 個", dialog_clone.display_names.len() - 5));
+                                break;
+                            }
+                        }
+
+                        ui.add_space(16.0);
+
+                        ui.horizontal(|ui| {
+                            if ui.button("ゴミ箱に移動").clicked() {
+                                // ゴミ箱に移動
+                                let file_manager = FileManager::new();
+                                let mut success_count = 0;
+                                let mut errors = Vec::new();
+                                for path in &dialog_clone.paths {
+                                    if let Err(e) = file_manager.delete(path, false) {
+                                        log::error!("削除に失敗: {}", e);
+                                        errors.push(format!("{}: {}", path.file_name().unwrap_or_default().to_string_lossy(), e));
+                                    } else {
+                                        success_count += 1;
+                                    }
+                                }
+                                self.state.delete_confirmation_dialog = None;
+                                // ディレクトリをリロード
+                                if let Some(ref mut browser) = self.state.directory_browser {
+                                    let _ = browser.reload();
+                                }
+                                // 結果メッセージを設定
+                                if errors.is_empty() {
+                                    self.state.operation_result_message = Some(
+                                        crate::app::state::OperationResultMessage::success(
+                                            format!("{} 個のアイテムをゴミ箱に移動しました", success_count)
+                                        )
+                                    );
+                                } else {
+                                    self.state.operation_result_message = Some(
+                                        crate::app::state::OperationResultMessage::error(
+                                            format!("削除に失敗: {}", errors.join(", "))
+                                        )
+                                    );
+                                }
+                            }
+
+                            if ui.button("完全に削除").clicked() {
+                                // 完全削除
+                                let file_manager = FileManager::new();
+                                let mut success_count = 0;
+                                let mut errors = Vec::new();
+                                for path in &dialog_clone.paths {
+                                    if let Err(e) = file_manager.delete(path, true) {
+                                        log::error!("削除に失敗: {}", e);
+                                        errors.push(format!("{}: {}", path.file_name().unwrap_or_default().to_string_lossy(), e));
+                                    } else {
+                                        success_count += 1;
+                                    }
+                                }
+                                self.state.delete_confirmation_dialog = None;
+                                // ディレクトリをリロード
+                                if let Some(ref mut browser) = self.state.directory_browser {
+                                    let _ = browser.reload();
+                                }
+                                // 結果メッセージを設定
+                                if errors.is_empty() {
+                                    self.state.operation_result_message = Some(
+                                        crate::app::state::OperationResultMessage::success(
+                                            format!("{} 個のアイテムを完全に削除しました", success_count)
+                                        )
+                                    );
+                                } else {
+                                    self.state.operation_result_message = Some(
+                                        crate::app::state::OperationResultMessage::error(
+                                            format!("削除に失敗: {}", errors.join(", "))
+                                        )
+                                    );
+                                }
+                            }
+
+                            if ui.button("キャンセル").clicked() {
+                                self.state.delete_confirmation_dialog = None;
+                            }
+                        });
+                    });
+                });
+        }
+
+        // リネームダイアログの表示
+        if self.state.rename_dialog.is_some() {
+            let mut should_close = false;
+            let mut should_rename = false;
+            let mut new_name = String::new();
+            let mut target_path = std::path::PathBuf::new();
+
+            if let Some(ref mut dialog) = self.state.rename_dialog {
+                new_name = dialog.new_name.clone();
+                target_path = dialog.path.clone();
+
+                egui::Window::new("名前の変更")
+                    .collapsible(false)
+                    .resizable(false)
+                    .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                    .show(ctx, |ui| {
+                        ui.label(format!("「{}」の新しい名前:", dialog.original_name));
+                        ui.add_space(8.0);
+
+                        let response = ui.text_edit_singleline(&mut dialog.new_name);
+                        if response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                            should_rename = true;
+                        }
+
+                        ui.add_space(16.0);
+                        ui.horizontal(|ui| {
+                            if ui.button("変更").clicked() {
+                                should_rename = true;
+                            }
+                            if ui.button("キャンセル").clicked() {
+                                should_close = true;
+                            }
+                        });
+
+                        new_name = dialog.new_name.clone();
+                    });
+            }
+
+            if should_rename && !new_name.is_empty() {
+                let original_name = self.state.rename_dialog.as_ref()
+                    .map(|d| d.original_name.clone())
+                    .unwrap_or_default();
+                let new_path = target_path.parent()
+                    .map(|p| p.join(&new_name))
+                    .unwrap_or_else(|| std::path::PathBuf::from(&new_name));
+
+                if let Err(e) = std::fs::rename(&target_path, &new_path) {
+                    log::error!("リネームに失敗: {}", e);
+                    self.state.operation_result_message = Some(
+                        crate::app::state::OperationResultMessage::error(
+                            format!("リネームに失敗: {}", e)
+                        )
+                    );
+                } else {
+                    log::info!("リネーム成功: {} -> {}", target_path.display(), new_path.display());
+                    // 履歴に追加
+                    self.state.operation_history.push(
+                        crate::core::operation_history::FileOperation::Rename {
+                            old_path: target_path.clone(),
+                            new_path: new_path.clone(),
+                        }
+                    );
+                    if let Some(ref mut browser) = self.state.directory_browser {
+                        let _ = browser.reload();
+                    }
+                    self.state.operation_result_message = Some(
+                        crate::app::state::OperationResultMessage::success(
+                            format!("「{}」を「{}」に変更しました", original_name, new_name)
+                        )
+                    );
+                }
+                self.state.rename_dialog = None;
+            } else if should_close {
+                self.state.rename_dialog = None;
+            }
+        }
+
+        // プロパティダイアログの表示
+        if self.state.properties_dialog.is_some() {
+            let mut should_close = false;
+
+            if let Some(ref dialog) = self.state.properties_dialog {
+                let dialog_clone = dialog.clone();
+                egui::Window::new("プロパティ")
+                    .collapsible(false)
+                    .resizable(false)
+                    .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                    .show(ctx, |ui| {
+                        ui.vertical(|ui| {
+                            ui.label(format!("名前: {}", dialog_clone.name));
+                            ui.label(format!("種類: {}", if dialog_clone.is_directory { "フォルダ" } else { "ファイル" }));
+                            ui.label(format!("サイズ: {} バイト", dialog_clone.size));
+                            ui.label(format!("読み取り専用: {}", if dialog_clone.is_readonly { "はい" } else { "いいえ" }));
+
+                            if let Some(modified) = dialog_clone.modified {
+                                if let Ok(duration) = modified.duration_since(std::time::UNIX_EPOCH) {
+                                    ui.label(format!("更新日時: {:?}", duration));
+                                }
+                            }
+
+                            ui.add_space(16.0);
+                            if ui.button("閉じる").clicked() {
+                                should_close = true;
+                            }
+                        });
+                    });
+            }
+
+            if should_close {
+                self.state.properties_dialog = None;
+            }
+        }
+
+        // コンテキストメニューの表示
+        if self.state.context_menu_state.is_some() {
+            let mut should_close = false;
+            let mut action_to_execute: Option<MenuAction> = None;
+            let mut menu_state_clone: Option<crate::app::state::ContextMenuState> = None;
+            let mut menu_rect: Option<egui::Rect> = None;
+
+            if let Some(ref menu_state) = self.state.context_menu_state {
+                menu_state_clone = Some(menu_state.clone());
+
+                let area_response = egui::Area::new(egui::Id::new("context_menu"))
+                    .fixed_pos(menu_state.position)
+                    .order(egui::Order::Foreground)
+                    .show(ctx, |ui| {
+                        egui::Frame::popup(ui.style()).show(ui, |ui| {
+                            ui.set_min_width(120.0);
+
+                            if ui.button("開く").clicked() {
+                                action_to_execute = Some(MenuAction::Open);
+                                should_close = true;
+                            }
+                            ui.separator();
+                            if ui.button("コピー").clicked() {
+                                action_to_execute = Some(MenuAction::Copy);
+                                should_close = true;
+                            }
+                            if ui.button("切り取り").clicked() {
+                                action_to_execute = Some(MenuAction::Cut);
+                                should_close = true;
+                            }
+                            ui.separator();
+                            if ui.button("名前の変更").clicked() {
+                                action_to_execute = Some(MenuAction::Rename);
+                                should_close = true;
+                            }
+                            if ui.button("削除").clicked() {
+                                action_to_execute = Some(MenuAction::Delete);
+                                should_close = true;
+                            }
+                            ui.separator();
+                            if ui.button("プロパティ").clicked() {
+                                action_to_execute = Some(MenuAction::Properties);
+                                should_close = true;
+                            }
+                        });
+                    });
+
+                menu_rect = Some(area_response.response.rect);
+            }
+
+            // メニュー外をクリックしたら閉じる（左クリック時のみ）
+            // pointer.primary_released() を使用して、右クリックでメニューを開いた直後に閉じるのを防ぐ
+            if ctx.input(|i| i.pointer.primary_released()) {
+                if let Some(pos) = ctx.input(|i| i.pointer.hover_pos()) {
+                    if let Some(rect) = menu_rect {
+                        if !rect.contains(pos) {
+                            should_close = true;
+                        }
+                    }
+                }
+            }
+
+            // Escキーでも閉じる
+            if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+                should_close = true;
+            }
+
+            // アクションの実行
+            if let Some(action) = action_to_execute {
+                if let Some(ref menu_state) = menu_state_clone {
+                    let file_manager = FileManager::new();
+                    match action {
+                        MenuAction::Open => {
+                            if menu_state.is_directory {
+                                if let Some(ref mut browser) = self.state.directory_browser {
+                                    let _ = browser.navigate_to(menu_state.entry_path.clone());
+                                    self.state.directory_search_query.clear();
+                                }
+                            } else {
+                                let _ = file_manager.open(&menu_state.entry_path);
+                            }
+                        }
+                        MenuAction::Copy => {
+                            self.state.clipboard_state.copy(vec![menu_state.entry_path.clone()]);
+                            self.state.operation_result_message = Some(
+                                crate::app::state::OperationResultMessage::success(
+                                    format!("「{}」をコピーしました", menu_state.entry_name)
+                                )
+                            );
+                        }
+                        MenuAction::Cut => {
+                            self.state.clipboard_state.cut(vec![menu_state.entry_path.clone()]);
+                            self.state.operation_result_message = Some(
+                                crate::app::state::OperationResultMessage::success(
+                                    format!("「{}」を切り取りました", menu_state.entry_name)
+                                )
+                            );
+                        }
+                        MenuAction::Delete => {
+                            self.state.delete_confirmation_dialog = Some(
+                                crate::app::state::DeleteConfirmationDialog::new(vec![menu_state.entry_path.clone()])
+                            );
+                        }
+                        MenuAction::Rename => {
+                            self.state.rename_dialog = Some(
+                                crate::app::state::RenameDialog::new(menu_state.entry_path.clone())
+                            );
+                        }
+                        MenuAction::Properties => {
+                            self.state.properties_dialog = Some(
+                                crate::app::state::PropertiesDialog::new(menu_state.entry_path.clone())
+                            );
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
+            if should_close {
+                self.state.context_menu_state = None;
             }
         }
 
