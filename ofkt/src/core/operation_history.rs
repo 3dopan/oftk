@@ -12,8 +12,6 @@ pub enum FileOperation {
     Delete {
         /// 削除されたファイルの元のパス
         original_path: PathBuf,
-        /// 操作前に存在したかどうか
-        existed: bool,
     },
     /// ファイル/フォルダの移動
     Move {

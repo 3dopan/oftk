@@ -122,8 +122,8 @@ pub struct AppState {
     /// 展開されているディレクトリのパスセット
     pub expanded_directories: HashSet<PathBuf>,
 
-    /// グローバルホットキーマネージャ
-    pub hotkey_manager: HotkeyManager,
+    /// グローバルホットキーマネージャ（初期化失敗時はNone）
+    pub hotkey_manager: Option<HotkeyManager>,
 
     /// システムトレイ
     pub system_tray: SystemTray,
@@ -418,15 +418,32 @@ impl OperationResultMessage {
     }
 }
 
+impl AppState {
+    /// いずれかのダイアログが表示中かをチェック
+    pub fn is_any_dialog_open(&self) -> bool {
+        self.delete_confirmation_dialog.is_some()
+            || self.rename_dialog.is_some()
+            || self.properties_dialog.is_some()
+            || self.overwrite_confirmation_dialog.is_some()
+            || self.add_quick_access_dialog.is_some()
+            || self.show_add_alias_dialog
+            || self.context_menu_state.is_some()
+    }
+}
+
 impl Default for AppState {
     fn default() -> Self {
-        // HotkeyManagerの初期化
-        let hotkey_manager = HotkeyManager::new()
-            .unwrap_or_else(|e| {
-                log::warn!("HotkeyManagerの初期化に失敗しました: {}", e);
-                // エラー時は後で再試行できるよう、デフォルトインスタンスを作成
-                HotkeyManager::new().expect("HotkeyManagerの作成に失敗しました")
-            });
+        // HotkeyManagerの初期化（失敗してもpanicせずNoneにする）
+        let hotkey_manager = match HotkeyManager::new() {
+            Ok(manager) => {
+                log::info!("HotkeyManagerの初期化に成功しました");
+                Some(manager)
+            }
+            Err(e) => {
+                log::warn!("HotkeyManagerの初期化に失敗しました: {}。ホットキー機能は無効になります。", e);
+                None
+            }
+        };
 
         Self {
             config: None,
@@ -526,17 +543,24 @@ impl AppState {
         }
 
         // 設定からホットキーを登録（フォールバック付き）
-        if let Err(e) = self.register_configured_hotkey() {
-            log::warn!("設定からのホットキー登録に失敗: {}。デフォルト設定を使用します。", e);
+        // hotkey_managerがNoneの場合はスキップ
+        if self.hotkey_manager.is_some() {
+            if let Err(e) = self.register_configured_hotkey() {
+                log::warn!("設定からのホットキー登録に失敗: {}。デフォルト設定を使用します。", e);
 
-            // デフォルト設定でリトライ
-            let default_modifiers = Modifiers::CONTROL | Modifiers::SHIFT;
-            let default_code = Code::KeyO;
-            if let Err(e) = self.hotkey_manager.register(default_modifiers, default_code) {
-                log::error!("デフォルトホットキーの登録も失敗: {}", e);
-            } else {
-                log::info!("デフォルトホットキーを登録しました: Ctrl+Shift+O");
+                // デフォルト設定でリトライ
+                let default_modifiers = Modifiers::CONTROL | Modifiers::SHIFT;
+                let default_code = Code::KeyO;
+                if let Some(ref mut manager) = self.hotkey_manager {
+                    if let Err(e) = manager.register(default_modifiers, default_code) {
+                        log::error!("デフォルトホットキーの登録も失敗: {}", e);
+                    } else {
+                        log::info!("デフォルトホットキーを登録しました: Ctrl+Shift+O");
+                    }
+                }
             }
+        } else {
+            log::warn!("HotkeyManagerが利用できないため、ホットキー登録をスキップします");
         }
 
         // システムトレイを構築
@@ -558,6 +582,10 @@ impl AppState {
 
     /// 設定ファイルから読み込んだホットキーを登録
     pub fn register_configured_hotkey(&mut self) -> Result<(), String> {
+        // HotkeyManagerが利用可能か確認
+        let manager = self.hotkey_manager.as_mut()
+            .ok_or_else(|| "HotkeyManagerが利用できません".to_string())?;
+
         // 設定が読み込まれているか確認
         let config = self.config.as_ref()
             .ok_or_else(|| "設定が読み込まれていません".to_string())?;
@@ -577,7 +605,7 @@ impl AppState {
             .map_err(|e| format!("キーコードの変換に失敗: {}", e))?;
 
         // ホットキーを登録
-        self.hotkey_manager.register(modifiers, code)
+        manager.register(modifiers, code)
             .map_err(|e| format!("ホットキーの登録に失敗: {}", e))?;
 
         log::info!("グローバルホットキーを登録しました: {:?}+{}",

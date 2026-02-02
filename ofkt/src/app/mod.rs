@@ -10,7 +10,6 @@ use crate::ui::context_menu::{ContextMenu, MenuAction};
 use crate::core::file_manager::FileManager;
 use crate::platform::{theme_detector, TrayEvent};
 use crate::utils::path::paths_equal;
-use std::time::{Duration, Instant};
 
 /// Ofkt アプリケーション
 pub struct OfktApp {
@@ -320,6 +319,49 @@ impl OfktApp {
 
         self.state.paste_result_message = Some(crate::app::state::PasteResultMessage::new(message, message_type));
     }
+
+    /// 削除処理を実行するヘルパーメソッド
+    ///
+    /// # 引数
+    /// * `paths` - 削除対象のパス一覧
+    /// * `permanent` - true: 完全削除、false: ゴミ箱に移動
+    fn execute_delete(&mut self, paths: &[std::path::PathBuf], permanent: bool) {
+        let file_manager = FileManager::new();
+        let mut success_count = 0;
+        let mut errors = Vec::new();
+
+        for path in paths {
+            if let Err(e) = file_manager.delete(path, permanent) {
+                log::error!("削除に失敗: {}", e);
+                errors.push(format!("{}: {}", path.file_name().unwrap_or_default().to_string_lossy(), e));
+            } else {
+                success_count += 1;
+            }
+        }
+
+        self.state.delete_confirmation_dialog = None;
+
+        // ディレクトリをリロード
+        if let Some(ref mut browser) = self.state.directory_browser {
+            let _ = browser.reload();
+        }
+
+        // 結果メッセージを設定
+        let action = if permanent { "完全に削除" } else { "ゴミ箱に移動" };
+        if errors.is_empty() {
+            self.state.operation_result_message = Some(
+                crate::app::state::OperationResultMessage::success(
+                    format!("{} 個のアイテムを{}しました", success_count, action)
+                )
+            );
+        } else {
+            self.state.operation_result_message = Some(
+                crate::app::state::OperationResultMessage::error(
+                    format!("削除に失敗: {}", errors.join(", "))
+                )
+            );
+        }
+    }
 }
 
 impl eframe::App for OfktApp {
@@ -501,8 +543,13 @@ impl eframe::App for OfktApp {
         // テーマを適用
         self.apply_theme(ctx);
 
-        // グローバルホットキーイベントをポーリング
-        if self.state.hotkey_manager.handle_events() {
+        // グローバルホットキーイベントをポーリング（HotkeyManagerが利用可能な場合のみ）
+        let hotkey_pressed = self.state.hotkey_manager
+            .as_ref()
+            .map(|m| m.handle_events())
+            .unwrap_or(false);
+
+        if hotkey_pressed {
             // イベント重複防止: 200ms以内の連続イベントを無視
             let now = Instant::now();
             let should_toggle = if let Some(last_time) = self.state.last_hotkey_time {
@@ -821,17 +868,9 @@ impl eframe::App for OfktApp {
 
                 // エイリアスモードのキーイベント処理（統合）
 
-                // ダイアログ表示中かどうかをチェック
-                let dialog_open = self.state.delete_confirmation_dialog.is_some()
-                    || self.state.rename_dialog.is_some()
-                    || self.state.properties_dialog.is_some()
-                    || self.state.overwrite_confirmation_dialog.is_some()
-                    || self.state.add_quick_access_dialog.is_some()
-                    || self.state.show_add_alias_dialog;
-
                 // メインパネルにフォーカスがある場合のみキーイベント処理を実行
                 // ダイアログ表示中はキー入力をスキップ
-                if self.state.current_focus_area == FocusArea::Main && !dialog_open {
+                if self.state.current_focus_area == FocusArea::Main && !self.state.is_any_dialog_open() {
                     if ctx.input(|i| i.key_pressed(egui::Key::ArrowDown)) {
                         let max_index = self.state.filtered_items.len().saturating_sub(1);
                         self.state.selected_index = Some(
@@ -1339,17 +1378,9 @@ impl eframe::App for OfktApp {
 
                         ui.separator();
 
-                        // ダイアログ表示中かどうかをチェック
-                        let dialog_open = self.state.delete_confirmation_dialog.is_some()
-                            || self.state.rename_dialog.is_some()
-                            || self.state.properties_dialog.is_some()
-                            || self.state.overwrite_confirmation_dialog.is_some()
-                            || self.state.add_quick_access_dialog.is_some()
-                            || self.state.show_add_alias_dialog;
-
                         // メインパネルにフォーカスがある場合のみキーイベント処理を実行
                         // ダイアログ表示中はキー入力をスキップ
-                        if self.state.current_focus_area == FocusArea::Main && !dialog_open {
+                        if self.state.current_focus_area == FocusArea::Main && !self.state.is_any_dialog_open() {
                             if ctx.input(|i| i.key_pressed(egui::Key::Enter)) {
                                 if let Some(idx) = self.state.selected_directory_index {
                                     if let Some(entry) = filtered_entries.get(idx) {
@@ -1829,8 +1860,14 @@ impl eframe::App for OfktApp {
         }
 
         // 削除確認ダイアログの表示
+        let mut delete_action: Option<bool> = None; // Some(true): 完全削除、Some(false): ゴミ箱
+        let mut delete_paths: Vec<std::path::PathBuf> = Vec::new();
+        let mut should_cancel_delete = false;
+
         if let Some(ref dialog) = self.state.delete_confirmation_dialog {
             let dialog_clone = dialog.clone();
+            delete_paths = dialog_clone.paths.clone();
+
             egui::Window::new("削除の確認")
                 .collapsible(false)
                 .resizable(false)
@@ -1854,79 +1891,26 @@ impl eframe::App for OfktApp {
 
                         ui.horizontal(|ui| {
                             if ui.button("ゴミ箱に移動").clicked() {
-                                // ゴミ箱に移動
-                                let file_manager = FileManager::new();
-                                let mut success_count = 0;
-                                let mut errors = Vec::new();
-                                for path in &dialog_clone.paths {
-                                    if let Err(e) = file_manager.delete(path, false) {
-                                        log::error!("削除に失敗: {}", e);
-                                        errors.push(format!("{}: {}", path.file_name().unwrap_or_default().to_string_lossy(), e));
-                                    } else {
-                                        success_count += 1;
-                                    }
-                                }
-                                self.state.delete_confirmation_dialog = None;
-                                // ディレクトリをリロード
-                                if let Some(ref mut browser) = self.state.directory_browser {
-                                    let _ = browser.reload();
-                                }
-                                // 結果メッセージを設定
-                                if errors.is_empty() {
-                                    self.state.operation_result_message = Some(
-                                        crate::app::state::OperationResultMessage::success(
-                                            format!("{} 個のアイテムをゴミ箱に移動しました", success_count)
-                                        )
-                                    );
-                                } else {
-                                    self.state.operation_result_message = Some(
-                                        crate::app::state::OperationResultMessage::error(
-                                            format!("削除に失敗: {}", errors.join(", "))
-                                        )
-                                    );
-                                }
+                                delete_action = Some(false);
                             }
 
                             if ui.button("完全に削除").clicked() {
-                                // 完全削除
-                                let file_manager = FileManager::new();
-                                let mut success_count = 0;
-                                let mut errors = Vec::new();
-                                for path in &dialog_clone.paths {
-                                    if let Err(e) = file_manager.delete(path, true) {
-                                        log::error!("削除に失敗: {}", e);
-                                        errors.push(format!("{}: {}", path.file_name().unwrap_or_default().to_string_lossy(), e));
-                                    } else {
-                                        success_count += 1;
-                                    }
-                                }
-                                self.state.delete_confirmation_dialog = None;
-                                // ディレクトリをリロード
-                                if let Some(ref mut browser) = self.state.directory_browser {
-                                    let _ = browser.reload();
-                                }
-                                // 結果メッセージを設定
-                                if errors.is_empty() {
-                                    self.state.operation_result_message = Some(
-                                        crate::app::state::OperationResultMessage::success(
-                                            format!("{} 個のアイテムを完全に削除しました", success_count)
-                                        )
-                                    );
-                                } else {
-                                    self.state.operation_result_message = Some(
-                                        crate::app::state::OperationResultMessage::error(
-                                            format!("削除に失敗: {}", errors.join(", "))
-                                        )
-                                    );
-                                }
+                                delete_action = Some(true);
                             }
 
                             if ui.button("キャンセル").clicked() {
-                                self.state.delete_confirmation_dialog = None;
+                                should_cancel_delete = true;
                             }
                         });
                     });
                 });
+        }
+
+        // 削除アクションの実行（ダイアログ表示後）
+        if let Some(permanent) = delete_action {
+            self.execute_delete(&delete_paths, permanent);
+        } else if should_cancel_delete {
+            self.state.delete_confirmation_dialog = None;
         }
 
         // リネームダイアログの表示
