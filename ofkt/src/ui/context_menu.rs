@@ -10,6 +10,8 @@ pub enum MenuAction {
     Copy,
     /// 切り取り（移動のため）
     Cut,
+    /// クリップボードから貼り付け
+    Paste,
     /// ファイル/フォルダを移動
     Move,
     /// 確認付きで削除
@@ -258,6 +260,7 @@ mod tests {
             MenuAction::Open,
             MenuAction::Copy,
             MenuAction::Cut,
+            MenuAction::Paste,
             MenuAction::Move,
             MenuAction::Delete,
             MenuAction::Rename,

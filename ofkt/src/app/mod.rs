@@ -2072,6 +2072,15 @@ impl eframe::App for OfktApp {
                                 action_to_execute = Some(MenuAction::Cut);
                                 should_close = true;
                             }
+                            // 貼り付けボタン（クリップボードが空の場合は無効化）
+                            if !self.state.clipboard_state.is_empty() {
+                                if ui.button("貼り付け").clicked() {
+                                    action_to_execute = Some(MenuAction::Paste);
+                                    should_close = true;
+                                }
+                            } else {
+                                ui.add_enabled(false, egui::Button::new("貼り付け"));
+                            }
                             ui.separator();
                             if ui.button("名前の変更").clicked() {
                                 action_to_execute = Some(MenuAction::Rename);
@@ -2139,6 +2148,10 @@ impl eframe::App for OfktApp {
                                     format!("「{}」を切り取りました", menu_state.entry_name)
                                 )
                             );
+                        }
+                        MenuAction::Paste => {
+                            // 現在のディレクトリにペースト
+                            self.handle_paste();
                         }
                         MenuAction::Delete => {
                             self.state.delete_confirmation_dialog = Some(
